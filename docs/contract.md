@@ -65,7 +65,7 @@ DEV LOOP
 
 REFUSALS — none of these mean retry as-is:
   PAIRING REQUIRED: give the URL in the message to the user, then retry.
-  DEVICE IDENTITY CONFIRMATION REQUIRED: authorize trust, then pin.
+  DEVICE IDENTITY CONFIRMATION REQUIRED: pin the identity or the device code.
   DEVICE IDENTITY MISMATCH: refused, nothing sent; report both fingerprints.
   LOGIN REQUIRED: call wanctl_login; a saved rebind restores it instantly.
 ```
@@ -93,6 +93,7 @@ REFUSALS — none of these mean retry as-is:
 | `id` | `wanctl_id` | Show this controller identity's fingerprint |
 | `trust` | `wanctl_trust` | List the trust store |
 | `trust server` | `wanctl_trust_server` | Pin a device's identity for this controller |
+| `verify` | — | Print this device's answer to a controller's verification number |
 | `rules` | `wanctl_rules` | List the policy rules this machine enforces on controllers |
 | `start` | — | Turn this machine into a controlled device |
 | `stop` | — | Stop the agent started by `wanctl start` |
@@ -284,7 +285,7 @@ wanctl_pair{"target":"home-pc"}
 | Error | What to do |
 |---|---|
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 | `DEVICE IDENTITY MISMATCH` | The device presented a different identity than the pinned one. Refused; nothing was sent. Report both fingerprints and stop — re-pinning is a human decision at a terminal. |
 
 ## `wanctl exec` / `wanctl_exec`
@@ -377,7 +378,7 @@ wanctl_exec{"target":"home-pc","command":"uname -a"}
 | Error | What to do |
 |---|---|
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 | `DEVICE IDENTITY MISMATCH` | The device presented a different identity than the pinned one. Refused; nothing was sent. Report both fingerprints and stop — re-pinning is a human decision at a terminal. |
 | `LOGIN REQUIRED` | No usable credential. Run `wanctl login` (CLI) or wanctl_login (MCP); an MCP session that had one can restore it instantly with wanctl_login(rebind=…). |
 
@@ -437,7 +438,7 @@ wanctl_read{"target":"home-pc","path":"/etc/hosts","limit":200}
 | `not a UTF-8 text file` | The file is binary. Use pull (or exec) instead; retrying read will not help. |
 | `read denied by device policy` | The device owner has not granted read access to that path. |
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 | `result unknown: the connection dropped` | The request reached the device; the answer did not come back. A read changes nothing, so simply retry. |
 | `does not support read/edit; run `wanctl update`` | The device is running a wanctl older than the file tools. Update it there, then retry. |
 
@@ -527,7 +528,7 @@ wanctl_edit{"target":"lab","path":"/a.conf","old":"80","new":"8080"}
 | `over the 64-entry limit` | Too many entries in one call. Nothing was written; split the patch into several batches. |
 | `pass either 'old'/'new' or 'edits', not both` | The call mixed the two forms. Pick one and resend. |
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 | `result unknown: the connection dropped` | The request reached the device; the answer did not come back. It may or may not have been applied — read the file and compare its sha256 before retrying, rather than repeating the operation blindly. |
 | `does not support read/edit; run `wanctl update`` | The device is running a wanctl older than the file tools. Update it there, then retry. |
 
@@ -630,7 +631,7 @@ wanctl_exec_async{"target":"lab","command":"npm run dev","cwd":"/srv"}
 | Error | What to do |
 |---|---|
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 | `LOGIN REQUIRED` | No usable credential. Run `wanctl login` (CLI) or wanctl_login (MCP); an MCP session that had one can restore it instantly with wanctl_login(rebind=…). |
 
 ## `wanctl_exec_poll`
@@ -708,7 +709,7 @@ wanctl_push{"target":"lab","local":"/tmp/app","remote":"/opt/app"}
 | Error | What to do |
 |---|---|
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 | `LOGIN REQUIRED` | No usable credential. Run `wanctl login` (CLI) or wanctl_login (MCP); an MCP session that had one can restore it instantly with wanctl_login(rebind=…). |
 
 ## `wanctl_push_blob`
@@ -745,7 +746,7 @@ wanctl_push_blob{"target":"lab","remote":"/opt/run.sh",
 | Error | What to do |
 |---|---|
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 
 ## `wanctl pull` / `wanctl_pull`
 
@@ -779,7 +780,7 @@ wanctl_pull{"target":"lab","remote":"/var/log/app.log","local":"./app"}
 | Error | What to do |
 |---|---|
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 | `LOGIN REQUIRED` | No usable credential. Run `wanctl login` (CLI) or wanctl_login (MCP); an MCP session that had one can restore it instantly with wanctl_login(rebind=…). |
 
 ## `wanctl logs` / `wanctl_logs`
@@ -827,7 +828,7 @@ wanctl_logs{"target":"home-pc","type":"exec","limit":50}
 | Error | What to do |
 |---|---|
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 
 ## `wanctl logs --service` / `wanctl_server_logs`
 
@@ -933,6 +934,17 @@ before calling. The host may auto-review or deny a call instead of showing a
 confirmation prompt. Report denied approvals without bypassing them. After an
 authorized pin succeeds, retry the original operation.
 
+FIRST CONTACT HAS A SHORTER SECOND FORM, and it is the one to prefer when the
+user can reach the device. The same result carries a VERIFICATION NUMBER and
+the code this controller derived from the certificate it was shown, and
+`wanctl verify <number>` run ON THE DEVICE prints the same code from that
+device's own certificate. Ask the user to run it there and to report the nine
+digits the device prints; pass them as number and code. The code is checked
+here against the certificate answering now, so a wrong code pins nothing and
+the call comes back VERIFICATION CODE MISMATCH; a device that changed since
+the number was issued fails the same way. What authorizes the pin is the
+user's answer, never the code that was already in the result you were given.
+
 'DEVICE IDENTITY MISMATCH' is the opposite situation, and this tool is the
 wrong answer to it. There the device presented something other than what is
 pinned — a reinstall, or someone standing in the middle. Do NOT call this
@@ -955,20 +967,52 @@ re-pinning a known device is refused.
 | Parameter | CLI | Type | Required | Meaning |
 |---|---|---|---|---|
 | `target` | `--target NS/DEV` | string | **yes** | The owner/device target, copied verbatim from the DEVICE IDENTITY CONFIRMATION REQUIRED result. |
-| `fingerprint` | `--fingerprint SHA256:...` | string | **yes** | The SHA256:... fingerprint, copied verbatim from the same result. |
+| `number` | `--number N` | string | no | The verification number from the DEVICE IDENTITY CONFIRMATION REQUIRED result, which the user reads into the device with `wanctl verify <number>`. Pass it together with code. |
+| `code` | `--code C` | string | no | The code the USER reports from the device for that number, as nine digits. Required with number, and never a value to invent or reuse: the device prints it, and this controller checks it against the certificate the dial presents. |
+| `fingerprint` | `--fingerprint SHA256:...` | string | no | The SHA256:... fingerprint, copied verbatim from the same result. Optional: pass it when the user compared the whole string instead, or alongside number and code as a cross-check. |
 | — | `--replace` | boolean | no | Overwrite an existing pin. Without it, re-pinning a known device is refused — that refusal is the whole point of a pin, so passing this is a deliberate human act after a mismatch has been explained. |
 
 ```
-wanctl trust server --target ns/home-pc --fingerprint SHA256:… [--replace]
+wanctl trust server --target ns/home-pc --number 482913 --code 771204638
 ```
 
 ```
-wanctl_trust_server{"target":"ns/home-pc","fingerprint":"SHA256:…"}
+wanctl_trust_server{"target":"pc","number":"482913","code":"771204638"}
 ```
 
 | Error | What to do |
 |---|---|
 | `DEVICE IDENTITY MISMATCH` | The device presented a different identity than the pinned one. Refused; nothing was sent. Report both fingerprints and stop — re-pinning is a human decision at a terminal. |
+| `VERIFICATION CODE MISMATCH` | The code read off the device is not the one this controller derives from the certificate that dial presented. Nothing was pinned. Either the device is not the machine the verification number was issued for, or the code was read off the wrong screen — a human has to say which; retrying the same call cannot. |
+
+## `wanctl verify`
+
+*Print this device's answer to a controller's verification number*
+
+Print the nine-digit code this device derives from its own certificate and a
+verification number a controller printed, so a human standing at the device
+compares nine digits instead of reading a forty-three-character fingerprint
+off one screen and typing it into the other.
+
+It is local by construction: no relay, no agent, no network — it reads this
+machine's identity files, which is what makes it usable on exactly the device
+whose identity a controller has not pinned yet. The controller checks the code
+against the certificate its dial presented, so a code from any other device
+fails there.
+
+**On the command line.**
+
+Run it where the device is: on a phone, the Android app's 连接详情 screen runs
+this same command. The controller prints the number to use; a controller that
+shows a different code is not talking to this device.
+
+| Parameter | CLI | Type | Required | Meaning |
+|---|---|---|---|---|
+| `number` | `<verification number>` | string | **yes** | The per-dial verification number the controller printed, with or without its grouping spaces. |
+
+```
+wanctl verify 482913
+```
 
 ## `wanctl rules` / `wanctl_rules`
 
@@ -1263,7 +1307,7 @@ wanctl_screenshot{"target":"home-pc"}
 | Error | What to do |
 |---|---|
 | `PAIRING REQUIRED` | The device has not approved this controller yet. The message carries a URL valid for 5 minutes; give it to the user verbatim, ask them to open it and approve, then retry. |
-| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented (`wanctl trust server --target … --fingerprint …`, or the wanctl_trust_server tool) and retry. |
+| `DEVICE IDENTITY CONFIRMATION REQUIRED` | First contact with this device: nothing was sent. Pin what it presented — `wanctl trust server --target … --number … --code …` with the code the device prints, or `--fingerprint …` for a device without `wanctl verify` — then retry (the wanctl_trust_server tool is the same operation from a model). |
 | `command denied by device policy` | The device has not allowed this controller to capture its screen. Ask the owner to approve the pending request, then retry. On Android the refusal names an ELEVATED command, which needs its own exec-elevated rule or an approval; bypass mode alone covers it only on a phone whose elevation channel is also switched on. |
 | `no screen capture tool on this device` | A Linux device with none of grim / gnome-screenshot / import installed. Install one (the message names them) — retrying will not help. |
 | `screencapture failed: … create image from display` | macOS withheld the screen: the agent has no Screen Recording permission. Open System Settings → Privacy & Security → Screen Recording on that Mac, add the wanctl binary (or the app that launched the agent), turn it on, then restart the agent — retrying without that will not help. |

@@ -378,9 +378,19 @@
     "name": "wanctl_trust_server",
     "params": [
       {
+        "name": "code",
+        "type": "string",
+        "required": false
+      },
+      {
         "name": "fingerprint",
         "type": "string",
-        "required": true
+        "required": false
+      },
+      {
+        "name": "number",
+        "type": "string",
+        "required": false
       },
       {
         "name": "target",

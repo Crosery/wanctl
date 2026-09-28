@@ -23,6 +23,37 @@ also accepted. Ambiguous names fail instead of selecting a device by registratio
 order. PostgreSQL-backed resolution includes offline devices in this check.
 The portal uses full IDs for actions and shows a short ID beside duplicate labels.
 
+## First contact
+
+A controller that has never dialled an installation stops with `DEVICE IDENTITY
+CONFIRMATION REQUIRED`, and nothing is sent to it until a human has confirmed
+which installation answered. Two values are offered for that confirmation:
+
+- the certificate fingerprint, `SHA256:<base64>` — precise, and forty-three
+  characters compared between a phone screen and a terminal;
+- a **verification number** (six digits, drawn fresh for this dial) and the
+  **verification code** derived from it and the certificate the dial presented.
+  `wanctl verify <number>` run on the device prints the same derivation computed
+  from that installation's own certificate, locally — no relay, no agent, no
+  network — and the Android app runs the same command from 连接详情 → 连接校验.
+  The controller accepts a code only if it reproduces it from the certificate
+  answering at that moment, so a code that did not come off that device pins
+  nothing, and a device that changed in between fails as a mismatch.
+
+The controller then records the result in its own `known_servers.json`:
+
+```sh
+wanctl trust server --target ns/device --number 482913 --code 771204638   # checked
+wanctl trust server --target ns/device --fingerprint SHA256:...           # compared by eye
+```
+
+The number is drawn per dial and reaches the device through the human, never over
+the relay, which is what lets nine digits carry the weight of the fingerprint
+they replace: a substituted certificate would have to collide with the real
+device's code for a number that did not exist when that certificate was chosen.
+The fingerprint comparison remains supported for a device whose wanctl predates
+`wanctl verify`.
+
 ## Upgrade
 
 Upgrade the relay and portal together, then agents and controllers. Migration 007

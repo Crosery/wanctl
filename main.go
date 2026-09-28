@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -22,6 +23,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/term"
 
 	"wanctl/internal/agent"
 	"wanctl/internal/catalog"
@@ -190,6 +193,8 @@ func main() {
 		err = cmdPeers(ctx)
 	case "id":
 		err = cmdID()
+	case "verify":
+		err = cmdVerify(os.Args[2:])
 	case "pair":
 		err = cmdPair(ctx, os.Args[2:])
 	case "trust":
@@ -1194,6 +1199,39 @@ func cmdID() error {
 	return nil
 }
 
+// cmdVerify prints this device's answer to a controller's verification number,
+// so the human standing at the device compares nine digits with the
+// controller's screen instead of reading forty-three characters off one screen
+// and typing them into the other.
+//
+// It is local by construction: no relay, no agent, nothing but the identity
+// files in this config dir. That is what makes it usable on exactly the device
+// whose identity is still unverified, and what lets the Android app run this
+// same command for a phone.
+func cmdVerify(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: wanctl verify <verification number>")
+	}
+	number, err := transport.NormalizeVerifyNumber(args[0])
+	if err != nil {
+		return err
+	}
+	id, err := transport.LoadIdentity()
+	if err != nil {
+		return err
+	}
+	code, err := transport.VerifyCode(id.Fingerprint, number)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("verification code: %s\n", transport.GroupDigits(code))
+	fmt.Printf("  for number:  %s\n", transport.GroupDigits(number))
+	fmt.Printf("  this device: %s\n", id.Fingerprint)
+	fmt.Println("Compare the code above with the one printed by the controller that shows the")
+	fmt.Println("same number. A controller showing a different code is not talking to this device.")
+	return nil
+}
+
 func cmdLogs(ctx context.Context, args []string) error {
 	fs := withHelp(flag.NewFlagSet("logs", flag.ExitOnError))
 	target := fs.String("target", "", "pull from this device over the relay (omit to read local device log)")
@@ -1360,27 +1398,105 @@ func cmdRules(args []string) error {
 	}
 }
 
+// pinDeviceTrust records a device identity by whichever verification the human
+// was able to make, and returns what it pinned.
+//
+// Three ways in, in the order a newcomer meets them:
+//
+//   - --number/--code: the device's own answer. The number comes from the
+//     first-contact refusal, `wanctl verify <number>` on the device prints the
+//     code, and the code is derived here from the certificate the dial presents
+//     — so a device that is not the one the number was issued for fails the
+//     comparison instead of being pinned.
+//   - no flags, on a terminal: the same check as one exchange. The number is
+//     printed, the code is asked for, and the pin happens on a match. The code
+//     this side would accept is deliberately NOT printed here: what the device
+//     showed is the answer, and typing what is on this screen would check
+//     nothing.
+//   - --fingerprint: the original way, kept for a device whose wanctl predates
+//     `wanctl verify`, and for anyone who would rather compare the whole string.
+func pinDeviceTrust(ctx context.Context, c *client.Client, target, fingerprint, number, code string, replace bool) (canonical, pinned string, err error) {
+	// A code is the answer to one number, so it is meaningless alone. Refuse it
+	// rather than fall through to the interactive prompt with the flag quietly
+	// dropped: the code is the value the human just read off the device, which
+	// makes losing it the likeliest small mistake here.
+	if number == "" && code != "" {
+		return "", "", fmt.Errorf("usage: wanctl trust server --target NS/DEV --number N --code C\n  --code is the code the device printed for a verification number, so it needs that --number")
+	}
+	switch {
+	case number != "":
+		if code == "" {
+			if code, err = askForVerificationCode(); err != nil {
+				return "", "", err
+			}
+		}
+		return c.ConfirmTrust(ctx, &client.TrustChallenge{Target: target, Fingerprint: fingerprint, Number: number}, code, replace)
+	case fingerprint != "":
+		if canonical, err = c.PinServer(ctx, target, fingerprint, replace); err != nil {
+			return "", "", err
+		}
+		return canonical, fingerprint, nil
+	case term.IsTerminal(int(os.Stdin.Fd())):
+		ch, err := c.ChallengeTrust(ctx, target)
+		if err != nil {
+			return "", "", err
+		}
+		if replace {
+			fmt.Printf("re-checking %q before replacing its pin\n", ch.Target)
+		} else {
+			fmt.Printf("first contact with %q — nothing is pinned yet\n", ch.Target)
+		}
+		fmt.Printf("  fingerprint:         %s\n", ch.Fingerprint)
+		fmt.Printf("  verification number: %s\n", transport.GroupDigits(ch.Number))
+		fmt.Printf("On that device run `wanctl verify %s` (Android app: 连接详情 → 连接校验),\n", ch.Number)
+		fmt.Println("then type the code it prints.")
+		reported, err := askForVerificationCode()
+		if err != nil {
+			return "", "", err
+		}
+		return c.ConfirmTrust(ctx, ch, reported, replace)
+	default:
+		return "", "", fmt.Errorf("usage: wanctl trust server --target NS/DEV [--number N --code C | --fingerprint SHA256:...] [--replace]\n  --number comes from the first-contact refusal; without any of these flags this command needs a terminal")
+	}
+}
+
+// askForVerificationCode reads the code a human read off the device.
+func askForVerificationCode() (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", fmt.Errorf("--code is required when stdin is not a terminal")
+	}
+	fmt.Print("verification code: ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	code := strings.TrimSpace(line)
+	if code == "" {
+		return "", fmt.Errorf("no verification code entered; nothing was pinned")
+	}
+	return code, nil
+}
+
 func cmdTrust(args []string) error {
 	if len(args) > 0 && args[0] == "server" {
 		fs := withHelp(flag.NewFlagSet("trust server", flag.ContinueOnError))
 		target := fs.String("target", "", "canonical owner/device target")
 		fingerprint := fs.String("fingerprint", "", "verified SHA256 device fingerprint")
+		number := fs.String("number", "", "verification number from the first-contact refusal")
+		code := fs.String("code", "", "the code the device printed for that number")
 		replace := fs.Bool("replace", false, "replace an existing pin after independent verification")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if *target == "" || *fingerprint == "" {
-			return fmt.Errorf("usage: wanctl trust server --target NS/DEV --fingerprint SHA256:... [--replace]")
+		if *target == "" {
+			return fmt.Errorf("usage: wanctl trust server --target NS/DEV [--number N --code C | --fingerprint SHA256:...] [--replace]")
 		}
 		c, err := client.New()
 		if err != nil {
 			return err
 		}
-		canonical, err := c.PinServer(context.Background(), *target, *fingerprint, *replace)
+		canonical, pinned, err := pinDeviceTrust(context.Background(), c, *target, *fingerprint, *number, *code, *replace)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("pinned device %q identity %s\n", canonical, *fingerprint)
+		fmt.Printf("pinned device %q identity %s\n", canonical, pinned)
 		return nil
 	}
 	which := "clients"

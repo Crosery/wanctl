@@ -82,9 +82,14 @@ The gates fire one at a time and each has a different fix, so the first three
 `wanctl exec` attempts fail differently:
 
 1. **The controller must confirm the device's identity.** `wanctl exec` prints a
-   `wanctl trust server --target … --fingerprint …` line. Compare that
-   fingerprint against the one the app shows under 指纹 — that comparison is the
-   whole point, so do it with your eyes rather than pasting.
+   verification number and the code this controller derived from the certificate
+   the device presented. Open 连接详情 → 连接校验 on the phone, type that number
+   in, and compare the nine digits it shows with the nine on the terminal — the
+   controller refuses any code it cannot derive from the certificate answering
+   now. The same refusal also carries the
+   `wanctl trust server --target … --fingerprint …` line, for a device whose
+   wanctl predates `wanctl verify`: that comparison is the whole point, so do it
+   with your eyes rather than pasting.
 2. **The device must trust the controller.** Unless 自动信任新控制端 is on, the
    agent refuses and prints a portal URL, valid five minutes, for the device
    owner to click.
