@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -67,7 +68,11 @@ type Config struct {
 	Identity      *transport.Identity
 	Known         *transport.Store
 	PublicOrigin  string // optional canonical origin when TLS terminates upstream
-	DebugWhoami   bool   // enable the diagnostic endpoint; never enable routinely
+	SMTPAddr      string
+	SMTPUser      string
+	SMTPPassword  string
+	MailFrom      string
+	DebugWhoami   bool // enable the diagnostic endpoint; never enable routinely
 
 	// GitHub OAuth login (self-hosted deployments). Setting GitHubClientID
 	// switches the portal to OAuth mode: identity comes only from the signed
@@ -82,6 +87,10 @@ type Config struct {
 
 // Server is the portal web app.
 type Server struct {
+	// waitCalls holds the /api/pending aggregate in progress per namespace.
+	waitMu    sync.Mutex
+	waitCalls map[string]*waitingCall
+
 	relayURL     string
 	relayPublic  string // user-reachable relay origin for download links
 	downloads    downloadsCache
@@ -91,6 +100,7 @@ type Server struct {
 	ghc          *http.Client
 	publicOrigin string
 	debugWhoami  bool
+	mail         mailSender
 	skillURL     string
 	transport    string // the transport this instance's controllers/devices use ("ws" or "http")
 	logs         *serverlog.Buffer
@@ -111,6 +121,7 @@ type Server struct {
 	larkMu      sync.Mutex
 	larkStarted bool
 	larkRuntime *larkRuntime
+	phone       *phoneSupervisor // approval phone workflow (ADR 0015); nil until Start
 }
 
 // New configures the portal. With an empty relayURL/secret the server still
@@ -138,6 +149,9 @@ func New(cfg Config) *Server {
 		sessionKey:     []byte(cfg.SessionSecret),
 		ghAuthBase:     strings.TrimRight(orDefault(cfg.GitHubAuthBase, "https://github.com"), "/"),
 		ghAPIBase:      strings.TrimRight(orDefault(cfg.GitHubAPIBase, "https://api.github.com"), "/"),
+	}
+	if cfg.SMTPAddr != "" && cfg.SMTPUser != "" && cfg.SMTPPassword != "" && cfg.MailFrom != "" {
+		s.mail = &smtpSender{addr: cfg.SMTPAddr, user: cfg.SMTPUser, password: cfg.SMTPPassword, from: cfg.MailFrom}
 	}
 	if cfg.GitHubTransport != nil {
 		s.ghc = &http.Client{Transport: cfg.GitHubTransport, Timeout: 15 * time.Second}
@@ -178,8 +192,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/auth/github", s.handleAuthStart)
 	mux.HandleFunc("/auth/callback", s.handleAuthCallback)
 	mux.HandleFunc("/auth/logout", s.handleAuthLogout)
-	mux.HandleFunc("/auth/redeem", s.handleAuthRedeem)
 	mux.HandleFunc("/auth/request-access", s.handleAccessRequest)
+	mux.HandleFunc("/auth/email", s.handleEmailPage)
+	mux.HandleFunc("/auth/email/status", s.handleEmailStatus)
+	mux.HandleFunc("/auth/email/send", s.handleEmailSend)
+	mux.HandleFunc("/auth/email/cancel", s.handleEmailCancel)
+	mux.HandleFunc("/auth/email/confirm", s.handleEmailConfirm)
 	mux.HandleFunc("/pending", s.handlePending)
 	mux.HandleFunc("/api/access-requests", s.handleAccessRequests)
 	mux.HandleFunc("/api/access-requests/decide", s.handleAccessDecide)
@@ -192,6 +210,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/pending", s.handleWaiting)
 	mux.HandleFunc("/api/devices/alias", s.handleDeviceAlias)
 	mux.HandleFunc("/api/devices/lark", s.handleDeviceLark)
+	mux.HandleFunc("/api/approval-phone", s.handleApprovalPhone)
 	mux.HandleFunc("/api/devices/notify", s.handleDeviceNotify)
 	mux.HandleFunc("/api/notify", s.handleNotify)
 	mux.HandleFunc("/api/notify/test", s.handleNotifyTest)
@@ -220,7 +239,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/devices/rules", s.handleDeviceRules)
 	mux.HandleFunc("/api/devices/mode", s.handleDeviceMode)
 	mux.HandleFunc("/api/devices/logs", s.handleDeviceLogs)
-	mux.HandleFunc("/api/devices/events", s.handleDeviceEvents)
 	mux.HandleFunc("/admin/logs", s.handleAdminLogs)
 	mux.HandleFunc("/api/docs/tree", s.handleDocsTree)
 	mux.HandleFunc("/api/docs/article/", s.handleDocsArticleGet)
@@ -288,6 +306,7 @@ var mutationPaths = map[string]bool{
 	"/api/devices/mode":            true,
 	"/api/devices/lark":            true,
 	"/api/devices/notify":          true,
+	"/api/approval-phone":          true,
 	"/api/notify":                  true,
 	"/api/notify/test":             true,
 	"/api/docs/articles":           true,
@@ -295,8 +314,10 @@ var mutationPaths = map[string]bool{
 	"/api/docs/groups":             true,
 	"/api/docs/groups/delete":      true,
 	"/auth/logout":                 true,
-	"/auth/redeem":                 true,
 	"/auth/request-access":         true,
+	"/auth/email/send":             true,
+	"/auth/email/cancel":           true,
+	"/auth/email/confirm":          true,
 	"/api/access-requests/decide":  true,
 	"/api/friends/request":         true,
 	"/api/friends/accept":          true,
@@ -311,8 +332,11 @@ var readWritePaths = map[string]bool{
 	"/api/acl":            true,
 	"/api/devices/lark":   true,
 	"/api/devices/notify": true,
+	"/api/approval-phone": true,
 	"/api/notify":         true,
 	"/api/invites":        true,
+	// GET is the page behind the link; only the POST confirms.
+	"/auth/email/confirm": true,
 }
 
 func (s *Server) securityMiddleware(next http.Handler) http.Handler {
@@ -360,7 +384,7 @@ func setSecurityHeaders(h http.Header) {
 	// the badge still falls back to the monogram. github.com is deliberately not
 	// added here; widening the policy to silence a broken-image edge case is the
 	// wrong trade for a console that holds device names and fingerprints.
-	h.Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self'")
+	h.Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self'")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Frame-Options", "DENY")
@@ -755,14 +779,18 @@ func (s *Server) requireNS(w http.ResponseWriter, r *http.Request) (string, bool
 		}
 		return "", false
 	}
-	ns, _, status, detail := s.resolveNamespace(p, "")
+	ns, _, status, detail := s.resolveNamespace(p)
 	switch status {
 	case resolveOK:
 		return ns, true
+	case resolveNeedsEmail:
+		http.Error(w, emailRequiredBody, http.StatusForbidden)
 	case resolvePending:
 		http.Error(w, pendingInviteBody, http.StatusForbidden)
 	case resolveConflict:
 		http.Error(w, detail, http.StatusConflict)
+	case resolveDisabled:
+		http.Error(w, accountDisabledBody, http.StatusForbidden)
 	default:
 		http.Error(w, detail, http.StatusBadGateway)
 	}
@@ -787,13 +815,28 @@ func (s *Server) proxyGet(w http.ResponseWriter, ns, path string) {
 	copyResp(w, resp)
 }
 
-// proxyPost merges the namespace into the client's JSON body and forwards a POST.
-func (s *Server) proxyPost(w http.ResponseWriter, r *http.Request, ns, path string) {
-	body := map[string]any{}
+// proxyPost forwards a POST to the relay admin API with the caller's namespace
+// set by the portal. Only the listed fields are taken from the client, matched
+// byte for byte, and anything else is refused: the relay decodes these bodies
+// with encoding/json, which matches keys case-insensitively under Unicode
+// folding, so a client key such as "nameſpace" (U+017F) would otherwise reach
+// the relay next to the portal's "namespace" and replace it.
+func (s *Server) proxyPost(w http.ResponseWriter, r *http.Request, ns, path string, fields ...string) {
+	body := map[string]json.RawMessage{}
 	if r.Body != nil {
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
 	}
-	body["namespace"] = ns
+	for k := range body {
+		if !slices.Contains(fields, k) {
+			http.Error(w, fmt.Sprintf("unknown field %q", k), http.StatusBadRequest)
+			return
+		}
+	}
+	nsJSON, _ := json.Marshal(ns)
+	body["namespace"] = nsJSON
 	resp, err := s.adminReq("POST", path, nil, body)
 	if err != nil {
 		http.Error(w, "relay unreachable", http.StatusBadGateway)
@@ -821,14 +864,20 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not signed in", http.StatusUnauthorized)
 		return
 	}
-	ns, role, status, detail := s.resolveNamespace(p, "")
+	ns, role, status, detail := s.resolveNamespace(p)
 	switch status {
 	case resolveOK:
+	case resolveNeedsEmail:
+		http.Error(w, emailRequiredBody, http.StatusForbidden)
+		return
 	case resolvePending:
 		http.Error(w, pendingInviteBody, http.StatusForbidden)
 		return
 	case resolveConflict:
 		http.Error(w, detail, http.StatusConflict)
+		return
+	case resolveDisabled:
+		http.Error(w, accountDisabledBody, http.StatusForbidden)
 		return
 	default:
 		http.Error(w, detail, http.StatusBadGateway)
@@ -849,6 +898,9 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"identity": p.Login, "login": p.Login, "name": p.Name,
 		"namespace": ns, "provider": p.Provider, "role": role,
 		"lark": s.larkEnabled(),
+		// Whether this instance has contact addresses at all: the settings
+		// page shows its email section only where one can be confirmed.
+		"mail": s.emailGate(),
 		// The SPA composes copy-pasteable `wanctl config set relay=…` lines,
 		// which need the public relay origin this instance runs on.
 		"relay_origin": s.relayPublic,
@@ -925,7 +977,15 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (string, b
 		http.Error(w, "not signed in", http.StatusUnauthorized)
 		return "", false
 	}
-	ns, role, status, detail := s.resolveNamespace(p, "")
+	ns, role, status, detail := s.resolveNamespace(p)
+	if status == resolveNeedsEmail {
+		http.Error(w, emailRequiredBody, http.StatusForbidden)
+		return "", false
+	}
+	if status == resolveDisabled {
+		http.Error(w, accountDisabledBody, http.StatusForbidden)
+		return "", false
+	}
 	if status != resolveOK {
 		http.Error(w, detail, http.StatusBadGateway)
 		return "", false
@@ -991,7 +1051,7 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "POST" {
-		s.proxyPost(w, r, ns, "/admin/tokens/issue")
+		s.proxyPost(w, r, ns, "/admin/tokens/issue", "label", "days")
 		return
 	}
 	s.proxyGet(w, ns, "/admin/tokens")
@@ -999,7 +1059,7 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	if ns, ok := s.requireNS(w, r); ok {
-		s.proxyPost(w, r, ns, "/admin/tokens/revoke")
+		s.proxyPost(w, r, ns, "/admin/tokens/revoke", "id")
 	}
 }
 
@@ -1015,10 +1075,17 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPost {
-		s.proxyPost(w, r, ns, "/admin/notify")
+		s.proxyPost(w, r, ns, "/admin/notify", notifyUpdateFields...)
 		return
 	}
 	s.proxyGet(w, ns, "/admin/notify")
+}
+
+// notifyUpdateFields are the webhook settings the portal lets a user change;
+// they mirror relay.notifyWebhookUpdate.
+var notifyUpdateFields = []string{
+	"url", "format", "keyword", "secret", "on_approval", "on_exec", "on_lifecycle",
+	"on_security", "exec_failures_only", "include_detail", "delete",
 }
 
 func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
@@ -1203,7 +1270,7 @@ func (s *Server) handleACL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "POST" {
-		s.proxyPost(w, r, ns, "/admin/acl")
+		s.proxyPost(w, r, ns, "/admin/acl", "device", "grantee", "manage")
 		return
 	}
 	s.proxyGet(w, ns, "/admin/acl")
@@ -1213,13 +1280,13 @@ func (s *Server) handleACL(w http.ResponseWriter, r *http.Request) {
 // proxy: the relay checks that the caller owns the device.
 func (s *Server) handleACLManage(w http.ResponseWriter, r *http.Request) {
 	if ns, ok := s.requireNS(w, r); ok {
-		s.proxyPost(w, r, ns, "/admin/acl/manage")
+		s.proxyPost(w, r, ns, "/admin/acl/manage", "device", "grantee", "manage")
 	}
 }
 
 func (s *Server) handleACLRevoke(w http.ResponseWriter, r *http.Request) {
 	if ns, ok := s.requireNS(w, r); ok {
-		s.proxyPost(w, r, ns, "/admin/acl/revoke")
+		s.proxyPost(w, r, ns, "/admin/acl/revoke", "id")
 	}
 }
 
@@ -1355,7 +1422,7 @@ func (s *Server) requireDeviceOwner(w http.ResponseWriter, r *http.Request, devi
 
 // deviceConnFor returns a warm console connection to ns/device, dialing if needed.
 // It uses double-checked locking so that two concurrent callers for the same absent
-// device (e.g. /api/devices/console and /api/devices/events on page load) do not
+// device (e.g. /api/devices/console and /api/pending on page load) do not
 // both dial and leak the losing connection. The goroutine that loses the post-dial
 // re-check closes its own conn and returns the winner's.
 func (s *Server) deviceConnFor(ctx context.Context, ns, device string) (*deviceConn, error) {
@@ -1764,37 +1831,4 @@ func (s *Server) handleDeviceLogs(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"logs":`))
 	w.Write(raw)
 	w.Write([]byte(`}`))
-}
-
-// eventPollWait bounds one long-poll on /api/devices/events. Shorter than the
-// relay's own poll windows so the request returns a finite response well before
-// any proxy idle timeout; the browser immediately re-polls.
-const eventPollWait = 25 * time.Second
-
-func (s *Server) handleDeviceEvents(w http.ResponseWriter, r *http.Request) {
-	device := r.URL.Query().Get("device")
-	ns, ok := s.requireDeviceUse(w, r, device)
-	if !ok {
-		return
-	}
-	d, err := s.deviceConnFor(r.Context(), ns, device)
-	if err != nil {
-		s.connError(w, device, err)
-		return
-	}
-	// Long-poll, not SSE: a buffering edge proxy holds streaming responses (and
-	// ignores X-Accel-Buffering), so an open text/event-stream never reaches the
-	// browser. Block for one approval-state push (or time out), return a finite
-	// JSON response nginx forwards promptly, and let the client re-poll.
-	notifs, unsubscribe := d.subscribe()
-	defer unsubscribe()
-	select {
-	case <-r.Context().Done():
-		w.WriteHeader(http.StatusNoContent)
-	case st := <-notifs:
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(st)
-	case <-time.After(eventPollWait):
-		w.WriteHeader(http.StatusNoContent) // no event this round; client re-polls
-	}
 }

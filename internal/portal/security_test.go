@@ -1,11 +1,14 @@
 package portal
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The identity badge is the only third-party image the portal loads. img-src
@@ -242,5 +245,34 @@ func TestMarkdownLinksAllowSafeRelativeOrHTTPURLs(t *testing.T) {
 	}
 	if !strings.Contains(src, "return s;") {
 		t.Fatal("markdown renderer does not allow safe relative URLs")
+	}
+}
+
+// No page the portal serves runs inline script, so the policy does not allow
+// it: an injected attribute or tag then has nothing to execute with.
+func TestCSPDoesNotAllowInlineScript(t *testing.T) {
+	rec := httptest.NewRecorder()
+	New(Config{}).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	for _, d := range strings.Split(rec.Header().Get("Content-Security-Policy"), ";") {
+		if d = strings.TrimSpace(d); strings.HasPrefix(d, "script-src ") && strings.Contains(d, "'unsafe-inline'") {
+			t.Fatalf("script-src allows inline script: %q", d)
+		}
+	}
+}
+
+func TestSessionNameCannotBeTampered(t *testing.T) {
+	s := newOAuthPortal(t, resolveOKAs("octocat", "user"))
+	value, err := s.encodeSession(&principal{Provider: "github", Subject: "8437", Login: "octocat", Name: "primary display name", Expires: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(value, ".")
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts[1] = base64.RawURLEncoding.EncodeToString(bytes.ReplaceAll(raw, []byte("primary display name"), []byte("attacker display name")))
+	if _, err := s.decodeSession(strings.Join(parts, ".")); err == nil {
+		t.Fatal("tampered session accepted")
 	}
 }

@@ -117,13 +117,11 @@ final class Prefs {
     /**
      * The elevation channels, off by default and separate from every other switch here.
      *
-     * <p>With it on, the agent may run a command through root, Shizuku, or the device's own adbd
-     * instead of inside the app sandbox — which is what makes {@code pm}, {@code am}, {@code
-     * input}, {@code screencap}, {@code dumpsys} and {@code settings} work at all. That is a real
-     * privilege boundary, so it gets its own decision rather than riding along on 自动放行所有命令: turning
-     * that switch on says "this device is unattended", not "hand out root". The agent enforces the
-     * same separation in its policy engine — bypass mode does not authorize an elevated command
-     * (ADR 0004).
+     * <p>With it on, the agent may run a command through root or the device's own adbd instead of
+     * inside the app sandbox — which is what makes {@code pm}, {@code am}, {@code input}, {@code
+     * screencap}, {@code dumpsys} and {@code settings} work at all. That is a real privilege
+     * boundary, so it gets its own decision rather than riding along on 自动放行所有命令: turning
+     * that switch on says "this device is unattended", not "hand out root".
      *
      * <p>Off does not merely deny the commands, it stops the channels being probed at all, so
      * nothing here raises a root-manager consent dialog on a device whose owner never asked for any
@@ -135,6 +133,19 @@ final class Prefs {
 
     void setElevation(boolean v) {
         sp.edit().putBoolean(ELEVATION, v).apply();
+    }
+
+    /**
+     * Set when the portal's test push arrives, which only happens to the phone the owner designated
+     * to approve for them (ADR 0015). It decides nothing but whether setup shows the lock-screen
+     * step for approval notifications.
+     */
+    boolean approvalPhone() {
+        return sp.getBoolean("approval_phone", false);
+    }
+
+    void setApprovalPhone() {
+        sp.edit().putBoolean("approval_phone", true).apply();
     }
 
     /** Empty means "let wanctl ask the property service", which yields e.g. "pa2353". */

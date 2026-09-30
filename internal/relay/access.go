@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"wanctl/internal/notify"
 )
@@ -47,6 +48,7 @@ type AccessRequest struct {
 	Provider  string     `json:"provider"`
 	Subject   string     `json:"subject"`
 	Login     string     `json:"login"`
+	Email     string     `json:"email"`
 	Note      string     `json:"note"`
 	Status    string     `json:"status"`
 	CreatedAt time.Time  `json:"created_at"`
@@ -213,6 +215,12 @@ func (r *Relay) adminAccessRequestStatus(w http.ResponseWriter, req *http.Reques
 		out["status"] = latest.Status
 		out["id"] = latest.ID
 		out["note"] = latest.Note
+		// The address is the identity's confirmed contact address. The
+		// applicant's own page only needs enough of it to recognise where an
+		// approval will be mailed.
+		if hint := maskEmail(latest.Email); hint != "" {
+			out["email_hint"] = hint
+		}
 		out["created_at"] = latest.CreatedAt
 		if latest.DecidedAt != nil {
 			out["decided_at"] = latest.DecidedAt
@@ -282,8 +290,14 @@ func (r *Relay) emitAccessRequested(request AccessRequest) {
 
 // --- PGStore ---
 
-const accessRequestColumns = `id, provider, subject, login, note, status,
-	created_at, decided_at, COALESCE(decided_by, '')`
+// email is not the column of that name, which v0.18.0 stopped writing: it is
+// the applicant's confirmed contact address, read at the moment of asking, so
+// an approval mail goes to wherever they confirmed last.
+const accessRequestColumns = `id, provider, subject, login, note,
+	COALESCE((SELECT c.address FROM contact_emails c
+	           WHERE c.provider = access_requests.provider AND c.subject = access_requests.subject
+	             AND c.confirmed_at IS NOT NULL), ''),
+	status, created_at, decided_at, COALESCE(decided_by, '')`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -292,7 +306,7 @@ type rowScanner interface {
 func scanAccessRequest(row rowScanner) (AccessRequest, error) {
 	var out AccessRequest
 	var decidedAt sql.NullTime
-	err := row.Scan(&out.ID, &out.Provider, &out.Subject, &out.Login, &out.Note,
+	err := row.Scan(&out.ID, &out.Provider, &out.Subject, &out.Login, &out.Note, &out.Email,
 		&out.Status, &out.CreatedAt, &decidedAt, &out.DecidedBy)
 	if decidedAt.Valid {
 		at := decidedAt.Time
@@ -442,4 +456,16 @@ func (p *PGStore) ListAdminNamespaces() ([]string, error) {
 		out = append(out, ns)
 	}
 	return out, rows.Err()
+}
+
+// maskEmail keeps the first character of the mailbox and the whole domain:
+// enough for someone to recognise their own address, not enough to read it
+// off a screen over their shoulder.
+func maskEmail(addr string) string {
+	at := strings.LastIndex(addr, "@")
+	if at < 1 || at == len(addr)-1 {
+		return ""
+	}
+	first, _ := utf8.DecodeRuneInString(addr)
+	return string(first) + "•••" + addr[at:]
 }

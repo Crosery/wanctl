@@ -2,10 +2,10 @@
 // supports two shapes:
 //   - ServeStdio: a child process spawned by an AI host on the user's machine,
 //     backed by the local wanctl config dir.
-//   - Handler / ServeHTTP: a Streamable HTTP server (multi-user) where each
-//     MCP client session has its own ephemeral state and the controller
-//     identity is HKDF-derived per namespace — so reconnects keep a stable
-//     fingerprint with no private-key persistence.
+//   - Handler: the relay's hosted Streamable HTTP endpoint (multi-user). Every
+//     request carries an OAuth 2.1 bearer, which names the namespace; the
+//     controller identity is HKDF-derived per namespace, so reconnects keep a
+//     stable fingerprint with no private-key persistence.
 package mcp
 
 import (
@@ -29,7 +29,6 @@ import (
 	"wanctl/internal/catalog"
 	"wanctl/internal/client"
 	"wanctl/internal/config"
-	"wanctl/internal/limits"
 	"wanctl/internal/mcpauth"
 	"wanctl/internal/policy"
 	"wanctl/internal/protocol"
@@ -62,42 +61,30 @@ func ServeStdioWorkspaceSession(enabled bool) error {
 			binding.ref = ref.String()
 		}
 		defer binding.link.Close()
-		return server.ServeStdio(newMCPServer(binding))
+		return server.ServeStdio(newMCPServer(false, binding))
 	}
-	s := newMCPServer()
-	return server.ServeStdio(s)
-}
-
-// Handler returns an http.Handler that serves Streamable HTTP MCP at whatever
-// path you mount it under (e.g. /mcp on the relay). seed must be ≥32 bytes; it
-// is used as the master secret for independently HKDF-deriving each namespace's
-// controller identity and the rebind AEAD key (so reconnects keep a stable
-// fingerprint without persisting private keys or exposing relay tokens).
-//
-// `endpointPath` is the public URL path the AI host POSTs to (usually "/mcp").
-// mcp-go uses it to rewrite session URLs in responses; pass the same value you
-// register the handler at.
-func Handler(seed []byte, endpointPath string) (http.Handler, error) {
-	return HandlerWithOptions(Options{Seed: seed, EndpointPath: endpointPath})
+	return server.ServeStdio(newMCPServer(false))
 }
 
 // Options configures the hosted MCP handler.
 type Options struct {
-	// Seed is the relay's MCP seed (≥32 bytes).
+	// Seed is the relay's MCP seed (≥32 bytes). It opens the OAuth access
+	// tokens (internal/mcpauth) and is the master secret each namespace's
+	// controller identity is HKDF-derived from.
 	Seed []byte
 	// EndpointPath is the public path the AI host POSTs to, usually "/mcp".
+	// mcp-go uses it to rewrite session URLs in responses; pass the same value
+	// the handler is registered at.
 	EndpointPath string
-	// OAuth, when non-nil, additionally accepts OAuth 2.1 bearer tokens.
+	// OAuth is required: a bearer is the only way into the hosted endpoint.
 	OAuth *OAuthConfig
 }
 
-// OAuthConfig turns on bearer authentication for the hosted endpoint.
-//
-// It exists because one class of client — ChatGPT's connector is the one that
-// forced the issue — starts a new MCP session for every single tool call. A
-// login stored against Mcp-Session-Id can never survive that, so those clients
-// saw "LOGIN REQUIRED" immediately after logging in successfully. A bearer is
-// carried on every request instead, so identity stops depending on the session.
+// OAuthConfig is how the hosted endpoint authenticates: every request carries
+// an OAuth 2.1 bearer, so identity never depends on the MCP session. Since
+// v0.19.0 it is the only way in. The code-and-rebind login that used to work
+// without it kept its logouts in process memory, so a relay restart revived a
+// logged-out credential (CX-04); see docs/adr/0008-mcp-oauth-split-portal-relay.md.
 type OAuthConfig struct {
 	// ResourceMetadataURL is what a 401 points the client at so it can start
 	// the authorization flow (RFC 9728).
@@ -112,21 +99,30 @@ type OAuthConfig struct {
 	Revoke func(namespace, token string) error
 }
 
-// HandlerWithOptions is Handler with the optional pieces spelled out.
-func HandlerWithOptions(o Options) (http.Handler, error) {
+// Handler returns the hosted Streamable HTTP MCP endpoint, for the relay to
+// mount at /mcp. A request without a valid OAuth bearer is answered 401 with
+// the challenge that starts a client's authorization flow, before mcp-go or
+// any tool sees it.
+func Handler(o Options) (http.Handler, error) {
 	if len(o.Seed) < 32 {
 		return nil, fmt.Errorf("mcp seed must be at least 32 bytes, got %d", len(o.Seed))
 	}
-	sessions = &sessionStore{
-		seed:    append([]byte(nil), o.Seed...),
-		m:       map[string]*remoteSession{},
-		revoked: map[string]time.Time{},
-		trust:   map[string]*transport.Store{},
-		oauth:   o.OAuth,
+	if o.OAuth == nil || o.OAuth.ResourceMetadataURL == "" {
+		return nil, errors.New("hosted MCP authenticates with OAuth only; it needs the relay's OAuth server (DATABASE_URL, WANCTL_PUBLIC_ORIGIN, WANCTL_PORTAL)")
 	}
-	go sessions.gcLoop()
-	s := newMCPServer()
-	opts := []server.StreamableHTTPOption{}
+	store := &sessionStore{
+		seed:  append([]byte(nil), o.Seed...),
+		m:     map[string]*remoteSession{},
+		open:  map[string]*transportSession{},
+		trust: map[string]*transport.Store{},
+		oauth: o.OAuth,
+	}
+	sessions = store
+	go store.gcLoop()
+	s := newMCPServer(true)
+	// Session IDs come from the store, which bounds and expires them; see
+	// hostedsessions.go.
+	opts := []server.StreamableHTTPOption{server.WithSessionIdManager(sessionIDs{store: store})}
 	if o.EndpointPath != "" {
 		opts = append(opts, server.WithEndpointPath(o.EndpointPath))
 	}
@@ -139,11 +135,23 @@ func HandlerWithOptions(o Options) (http.Handler, error) {
 		}
 		return ctx
 	}))
-	h := refuseBrowserOrigins(server.NewStreamableHTTPServer(s, opts...))
-	if o.OAuth != nil {
-		h = oauthGate(append([]byte(nil), o.Seed...), o.OAuth, h)
-	}
-	return h, nil
+	streamable := server.NewStreamableHTTPServer(s, opts...)
+	store.terminate = terminateVia(streamable)
+	return oauthGate(append([]byte(nil), o.Seed...), o.OAuth, refuseBrowserOrigins(store.gate(streamable))), nil
+}
+
+// Unavailable is what a relay mounts at /mcp when it cannot run the hosted
+// endpoint, so a client that was pointed there is told why instead of getting
+// a bare 404.
+func Unavailable(reason string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0", "id": nil,
+			"error": map[string]any{"code": -32000, "message": reason},
+		})
+	})
 }
 
 type oauthClaimKey struct{}
@@ -153,15 +161,21 @@ func oauthClaimFrom(ctx context.Context) (mcpauth.Claim, bool) {
 	return claim, ok
 }
 
-// oauthGate authenticates the bearer before mcp-go sees the request.
-//
-// No Authorization header keeps the old path exactly as it was: a session keyed
-// by Mcp-Session-Id, logging in through wanctl_login. Clients that hold their
-// session open — Claude Code, Codex, Cursor — never notice this code exists.
+// oauthGate authenticates the bearer before mcp-go sees the request. Every
+// request needs one. A request with no Authorization at all gets the bare
+// challenge (RFC 6750 §3.1: no error code when no credential was offered),
+// which is what sends an MCP client to the resource metadata and on into the
+// authorization flow.
 func oauthGate(seed []byte, cfg *OAuthConfig, next http.Handler) http.Handler {
 	challenge := `Bearer resource_metadata="` + cfg.ResourceMetadataURL + `"`
 	deny := func(w http.ResponseWriter, code, description string) {
-		w.Header().Set("WWW-Authenticate", challenge+`, error="`+code+`", error_description="`+description+`"`)
+		// invalid_request is sent only when no credential was offered at all,
+		// and then the challenge carries no error code (RFC 6750 §3.1).
+		header := challenge
+		if code != "invalid_request" {
+			header += `, error="` + code + `", error_description="` + description + `"`
+		}
+		w.Header().Set("WWW-Authenticate", header)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":"` + code + `","error_description":"` + description + `"}`))
@@ -169,7 +183,7 @@ func oauthGate(seed []byte, cfg *OAuthConfig, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		raw := strings.TrimSpace(req.Header.Get("Authorization"))
 		if raw == "" {
-			next.ServeHTTP(w, req)
+			deny(w, "invalid_request", "this endpoint needs an OAuth 2.1 access token; authorize to get one")
 			return
 		}
 		bearer := ""
@@ -200,8 +214,8 @@ func oauthGate(seed []byte, cfg *OAuthConfig, next http.Handler) http.Handler {
 // refuseBrowserOrigins turns away requests that carry an Origin header the
 // operator did not allow. MCP clients are programs and send no Origin; a
 // browser page always does, and a page the operator merely visited could
-// otherwise reach a localhost `wanctl mcp --http` or DNS-rebind to a bound
-// address and drive it (audit 2026-08-28, SEC-E-05). WANCTL_MCP_ALLOWED_ORIGINS
+// otherwise DNS-rebind to a bound address and drive it (audit 2026-08-28,
+// SEC-E-05). WANCTL_MCP_ALLOWED_ORIGINS
 // is a comma-separated allow-list for deliberate browser-based hosts.
 func refuseBrowserOrigins(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -222,28 +236,13 @@ func originAllowed(origin string) bool {
 	return false
 }
 
-// ServeHTTP is a convenience for `wanctl mcp --http :addr` that builds a
-// standalone HTTP server on addr and mounts the MCP handler at /mcp.
-func ServeHTTP(addr string, seed []byte) error {
-	h, err := Handler(seed, "/mcp")
-	if err != nil {
-		return err
-	}
-	fmt.Printf("wanctl mcp listening on %s (Streamable HTTP); endpoint = /mcp\n", addr)
-	mux := http.NewServeMux()
-	mux.Handle("/mcp", h)
-	mux.Handle("/mcp/", h)
-	return limits.HTTPServer(addr, mux).ListenAndServe()
-}
-
 // --- session abstraction ---
 
 // sessionAPI is the per-client backing the MCP tools talk to. Two impls:
 //   - localFsSession (stdio): persists to wanctl's local config dir
-//   - remoteSession (http): in-memory state + namespace-derived identity
+//   - remoteSession (http): an OAuth bearer's state + namespace-derived identity
 type sessionAPI interface {
 	client() (*client.Client, *mcpapi.CallToolResult)
-	saveLogin(token, namespace string) error
 	clearLogin() error
 	info() string // for wanctl_status
 	relayURL() (string, error)
@@ -261,13 +260,18 @@ type sessionStore struct {
 	stdio *localFsSession
 
 	// http mode
-	seed    []byte
-	m       map[string]*remoteSession
-	revoked map[string]time.Time // process-local JTI revocations; not durable across restart
+	seed []byte
+	// m is the state behind each bearer, keyed by the access token's JTI
+	// rather than by Mcp-Session-Id: the same bearer reaching us in two
+	// unrelated MCP sessions is one logged-in person, not two strangers.
+	m map[string]*remoteSession
+	// open is every transport session admitted and not yet closed, keyed by
+	// Mcp-Session-Id (hostedsessions.go). terminate has mcp-go free its own
+	// state for one; clock stands in for time.Now in tests.
+	open      map[string]*transportSession
+	terminate func(id string)
+	clock     func() time.Time
 
-	// OAuth sessions are keyed by the access token's JTI rather than by
-	// Mcp-Session-Id, which is the whole point: the same bearer reaching us in
-	// two unrelated MCP sessions is one logged-in person, not two strangers.
 	oauth *OAuthConfig
 	// trust is the pinned-server store, shared by namespace. A per-session
 	// store cannot work here — a client that opens a new session per call would
@@ -287,27 +291,15 @@ func (s *sessionStore) get(ctx context.Context) sessionAPI {
 	if claim, ok := oauthClaimFrom(ctx); ok {
 		return s.oauthSession(claim)
 	}
-	sid := "default"
-	if cs := server.ClientSessionFromContext(ctx); cs != nil {
-		sid = cs.SessionID()
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r := s.m[sid]
-	if r == nil {
-		r = &remoteSession{
-			id: sid, seed: s.seed, owner: s, known: transport.NewMemStore(),
-			rebindJTIs: map[string]time.Time{}, lastUsed: time.Now(),
-		}
-		s.m[sid] = r
-	}
-	r.lastUsed = time.Now()
-	return r
+	// The gate answers every hosted request without a valid bearer with 401,
+	// so a tool call cannot get here. Should that ever stop being true, a
+	// session with no token reaches no device.
+	return &remoteSession{seed: s.seed, owner: s}
 }
 
 // oauthSession returns the session a bearer names, already logged in. There is
-// no wanctl_login step on this path: the browser trip that minted the token was
-// the login, and the token carries the namespace and the relay credential.
+// no login step on this path: the browser trip that minted the token was the
+// login, and the token carries the namespace and the relay credential.
 func (s *sessionStore) oauthSession(claim mcpauth.Claim) sessionAPI {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -317,13 +309,12 @@ func (s *sessionStore) oauthSession(claim mcpauth.Claim) sessionAPI {
 		r = &remoteSession{
 			id: key, seed: s.seed, owner: s,
 			known:      s.trustForLocked(claim.Namespace),
-			rebindJTIs: map[string]time.Time{},
-			oauth:      true, oauthClaim: claim,
-			token: claim.Token, namespace: claim.Namespace,
+			oauthClaim: claim,
+			token:      claim.Token, namespace: claim.Namespace,
 		}
 		s.m[key] = r
 	}
-	r.lastUsed = time.Now()
+	r.lastUsed = s.now()
 	return r
 }
 
@@ -341,8 +332,8 @@ func (s *sessionStore) trustForLocked(namespace string) *transport.Store {
 	return store
 }
 
-// forgetPin drops whatever identity is pinned under one namespace/device,
-// across every hosted session that namespace has open.
+// forgetPin drops whatever identity is pinned under one namespace/device, for
+// every hosted session of that namespace: they all share one store.
 //
 // Without it the hosted pin is the dead end ADR 0002 describes: a reinstalled
 // device presents a new certificate, every call fails with an identity
@@ -356,25 +347,11 @@ func (s *sessionStore) forgetPin(namespace, device string) {
 	if s == nil || namespace == "" || device == "" {
 		return
 	}
-	name := namespace + "/" + device
-	// Two places hold pins: the per-namespace store OAuth sessions share, and
-	// the private store a session-keyed login gets. Both have to forget, or a
-	// client that never took the OAuth path keeps the stale pin.
-	var stores []*transport.Store
 	s.mu.Lock()
-	if store := s.trust[namespace]; store != nil {
-		stores = append(stores, store)
-	}
-	for _, r := range s.m {
-		r.mu.Lock()
-		if r.namespace == namespace && r.known != nil {
-			stores = append(stores, r.known)
-		}
-		r.mu.Unlock()
-	}
+	store := s.trust[namespace]
 	s.mu.Unlock()
-	for _, store := range stores {
-		_ = store.RemoveName(name)
+	if store != nil {
+		_ = store.RemoveName(namespace + "/" + device)
 	}
 }
 
@@ -387,21 +364,12 @@ func ForgetPinnedDevice(namespace, device string) {
 	sessions.forgetPin(namespace, device)
 }
 
-// gcLoop prunes idle HTTP sessions every minute (TTL 1h). Cheap because state
-// is small and re-login is just one user click.
+// gcLoop closes idle HTTP sessions every minute; see sweep for the limits.
 func (s *sessionStore) gcLoop() {
-	const ttl = time.Hour
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for range t.C {
-		cutoff := time.Now().Add(-ttl)
-		s.mu.Lock()
-		for id, r := range s.m {
-			if r.lastUsed.Before(cutoff) {
-				delete(s.m, id)
-			}
-		}
-		s.mu.Unlock()
+		s.sweep()
 	}
 }
 
@@ -482,8 +450,7 @@ func resolveExisting(p string) string {
 	}
 }
 
-func (l *localFsSession) saveLogin(token, _ string) error { return config.SaveToken(token) }
-func (l *localFsSession) clearLogin() error               { return config.ClearToken() }
+func (l *localFsSession) clearLogin() error { return config.ClearToken() }
 func (l *localFsSession) relayURL() (string, error) {
 	relay, err := config.Relay()
 	if err != nil {
@@ -517,7 +484,7 @@ func (l *localFsSession) info() string {
 	return out
 }
 
-// --- remote (HTTP) session: per-Mcp-Session-Id, ephemeral, identity derived ---
+// --- remote (HTTP) session: one per OAuth bearer, ephemeral, identity derived ---
 
 type remoteSession struct {
 	id         string
@@ -528,12 +495,7 @@ type remoteSession struct {
 	namespace  string
 	identity   *transport.Identity
 	known      *transport.Store
-	rebindJTIs map[string]time.Time
 	lastUsed   time.Time
-
-	// Set when this session was reached with an OAuth bearer. Such a session is
-	// born logged in and has no wanctl_login step.
-	oauth      bool
 	oauthClaim mcpauth.Claim
 }
 
@@ -572,7 +534,7 @@ func (r *remoteSession) client() (*client.Client, *mcpapi.CallToolResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.token == "" {
-		return nil, loginRequired()
+		return nil, notAuthorized()
 	}
 	if err := r.ensureIdentity(); err != nil {
 		return nil, mcpapi.NewToolResultError("derive identity: " + err.Error())
@@ -592,113 +554,22 @@ func (r *remoteSession) client() (*client.Client, *mcpapi.CallToolResult) {
 	return c, nil
 }
 
-func (r *remoteSession) saveLogin(token, namespace string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.token, r.namespace, r.identity = token, namespace, nil // force re-derive
-	return r.ensureIdentity()
-}
-
-// saveLoginAndIssue atomically binds a remote session and records the newly
-// issued rebind JTI so a subsequent logout can revoke it in this process.
-func (r *remoteSession) saveLoginAndIssue(token, namespace string, now time.Time) (string, error) {
-	if r.owner == nil {
-		return "", fmt.Errorf("remote session has no owner")
+// clearLogin is wanctl_logout. Forgetting the token in this process would mean
+// nothing: the bearer carries it, and the next request rebuilds the session
+// from it. Logging out has to reach the relay and kill the namespace token.
+func (r *remoteSession) clearLogin() error {
+	if r.owner == nil || r.owner.oauth == nil || r.owner.oauth.Revoke == nil {
+		return fmt.Errorf("this endpoint cannot revoke OAuth grants; revoke the token in the portal instead")
 	}
-	r.owner.mu.Lock()
-	defer r.owner.mu.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.token, r.namespace, r.identity = token, namespace, nil
-	if err := r.ensureIdentity(); err != nil {
-		return "", err
-	}
-	credential, claim, err := sealRebind(r.owner.seed, namespace, token, now)
-	if err != nil {
-		return "", err
-	}
-	if r.rebindJTIs == nil {
-		r.rebindJTIs = map[string]time.Time{}
-	}
-	r.rebindJTIs[claim.JTI] = time.Unix(claim.ExpiresAt, 0)
-	return credential, nil
-}
-
-func (r *remoteSession) restoreLogin(claim rebindClaim, namespace string, now time.Time) error {
-	if r.owner == nil {
-		return fmt.Errorf("remote session has no owner")
-	}
-	if namespace != claim.Namespace {
-		return fmt.Errorf("rebind namespace %q does not match Relay namespace %q", claim.Namespace, namespace)
-	}
-	if claim.ExpiresAt <= now.Unix() {
-		return ErrExpiredRebind
-	}
-	r.owner.mu.Lock()
-	defer r.owner.mu.Unlock()
-	if expiry, revoked := r.owner.revoked[claim.JTI]; revoked {
-		if now.Before(expiry) {
-			return ErrRevokedRebind
-		}
-		delete(r.owner.revoked, claim.JTI)
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.token, r.namespace, r.identity = claim.Token, namespace, nil
-	if err := r.ensureIdentity(); err != nil {
+	if err := r.owner.oauth.Revoke(r.namespace, r.token); err != nil {
 		return err
 	}
-	if r.rebindJTIs == nil {
-		r.rebindJTIs = map[string]time.Time{}
-	}
-	r.rebindJTIs[claim.JTI] = time.Unix(claim.ExpiresAt, 0)
-	return nil
-}
-
-func (r *remoteSession) clearLogin() error {
-	// On the OAuth path, forgetting the token in this process would mean
-	// nothing: the bearer carries it, and the next request rebuilds the session
-	// from it. Logging out has to reach the relay and kill the namespace token.
-	if r.oauth {
-		if r.owner == nil || r.owner.oauth == nil || r.owner.oauth.Revoke == nil {
-			return fmt.Errorf("this endpoint cannot revoke OAuth grants; revoke the token in the portal instead")
-		}
-		if err := r.owner.oauth.Revoke(r.namespace, r.token); err != nil {
-			return err
-		}
-		r.owner.mu.Lock()
-		delete(r.owner.m, r.id)
-		r.owner.mu.Unlock()
-		r.mu.Lock()
-		r.token, r.namespace, r.identity = "", "", nil
-		r.mu.Unlock()
-		return nil
-	}
-	if r.owner != nil {
-		r.owner.mu.Lock()
-		defer r.owner.mu.Unlock()
-	}
+	r.owner.mu.Lock()
+	delete(r.owner.m, r.id)
+	r.owner.mu.Unlock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.owner != nil {
-		if r.owner.revoked == nil {
-			r.owner.revoked = map[string]time.Time{}
-		}
-		now := time.Now()
-		for jti, expiry := range r.owner.revoked {
-			if !now.Before(expiry) {
-				delete(r.owner.revoked, jti)
-			}
-		}
-		for jti, expiry := range r.rebindJTIs {
-			if now.Before(expiry) {
-				r.owner.revoked[jti] = expiry
-			}
-		}
-	}
 	r.token, r.namespace, r.identity = "", "", nil
-	r.known = transport.NewMemStore()
-	r.rebindJTIs = map[string]time.Time{}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -713,18 +584,13 @@ func (r *remoteSession) relayURL() (string, error) {
 func (r *remoteSession) info() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := "mode:                  http (remote, per-MCP-session state)\n"
-	if r.oauth {
-		// A client on this path may open a new MCP session per call, so the
-		// session id is noise. What answers "am I logged in" is the bearer.
-		out = "mode:                  http (remote, OAuth bearer)\n"
-		out += "client:                " + r.oauthClaim.ClientID + "\n"
-		out += "access token expires:  " + r.oauthClaim.Expiry().UTC().Format(time.RFC3339) + "\n"
-	} else {
-		out += "session id:            " + r.id + "\n"
-	}
+	// A client may open a new MCP session per call, so the session id is
+	// noise. What answers "am I logged in" is the bearer.
+	out := "mode:                  http (remote, OAuth bearer)\n"
+	out += "client:                " + r.oauthClaim.ClientID + "\n"
+	out += "access token expires:  " + r.oauthClaim.Expiry().UTC().Format(time.RFC3339) + "\n"
 	if r.token == "" {
-		out += "status:                NOT logged in — call wanctl_login() to start\n"
+		out += "status:                NOT authorized — this connection's grant was revoked; authorize the connector again\n"
 	} else {
 		out += "status:                logged in to namespace \"" + r.namespace + "\"\n"
 		if r.identity != nil {
@@ -770,23 +636,27 @@ func configuredValue(value string) string {
 // AI reading a tool description and a human reading the help see one text, not
 // two that drifted. What stays here is the handler behind each name.
 // newMCPServer builds the server both transports serve: the same tools, and the
-// same instructions.
+// same instructions, less the local login on the hosted endpoint, whose bearer
+// already is the login.
 //
 // The instructions are the catalog's — what wanctl is, every primitive in one
 // list, the loop they compose into, the refusals to recognise. A host reads
 // them once, before any tool call, which is the only moment at which "read the
 // project's AGENTS.md first" can still change what happens.
-func newMCPServer(bindings ...*workspaceConversation) *server.MCPServer {
+func newMCPServer(hosted bool, bindings ...*workspaceConversation) *server.MCPServer {
 	instructions := catalog.Instructions()
-	if len(bindings) > 0 {
+	switch {
+	case hosted:
+		instructions = catalog.HostedInstructions()
+	case len(bindings) > 0:
 		instructions = catalog.WorkspaceSessionInstructions
 	}
 	s := server.NewMCPServer("wanctl", "1.0.0", server.WithInstructions(instructions), server.WithOutputSchemaValidation())
-	registerMCPTools(s, bindings...)
+	registerMCPTools(s, hosted, bindings...)
 	return s
 }
 
-func registerMCPTools(s *server.MCPServer, bindings ...*workspaceConversation) {
+func registerMCPTools(s *server.MCPServer, hosted bool, bindings ...*workspaceConversation) {
 	handlers := map[string]server.ToolHandlerFunc{
 		"mcpLogin":       mcpLogin,
 		"mcpStatus":      mcpStatus,
@@ -815,6 +685,9 @@ func registerMCPTools(s *server.MCPServer, bindings ...*workspaceConversation) {
 		if len(bindings) > 0 && !workspaceSessionTool(c.MCPName) {
 			continue
 		}
+		if hosted && c.StdioOnly {
+			continue
+		}
 		h, ok := handlers[c.Handler]
 		if !ok {
 			// A catalog entry naming a handler that does not exist would
@@ -835,7 +708,7 @@ func registerMCPTools(s *server.MCPServer, bindings ...*workspaceConversation) {
 				c.Desc = "CONVERSATION MODE: the entered workspace is injected automatically. Do not provide target or workspace.\n\n" + c.Desc
 			}
 		}
-		s.AddTool(mcpapi.NewTool(c.MCPName, toolOptions(c)...), h)
+		s.AddTool(mcpapi.NewTool(c.MCPName, toolOptions(c)...), escapeDeviceOutput(c.MCPName, h))
 	}
 }
 
@@ -994,58 +867,30 @@ func identityMismatchResult(e *transport.MismatchError) *mcpapi.CallToolResult {
 	))
 }
 
+// loginRequired is the local (stdio) server with no credential in its config.
 func loginRequired() *mcpapi.CallToolResult {
 	return mcpapi.NewToolResultError(
-		"LOGIN REQUIRED. This MCP session has no wanctl credentials right now.\n" +
-			"FIRST: if earlier in THIS conversation a wanctl_login succeeded and returned a `rebind` credential, the user is almost certainly still authorized — the in-memory session was just lost (relay restart / reconnect). Call wanctl_login(rebind=\"…\") with that saved credential to restore access INSTANTLY; do NOT bother the user. " +
-			"ONLY if you have no saved rebind credential: call wanctl_login() (no args) — it returns a URL + instructions to show the user, who signs in to the portal and pastes back a one-time code for wanctl_login(code=\"…\"). Then retry your previous tool call.",
+		"LOGIN REQUIRED. This machine's wanctl has no credential.\n" +
+			"Call wanctl_login() (no args): it returns a URL + instructions to show the user, who signs in to the portal and pastes back a one-time code for wanctl_login(code=\"…\"). Then retry your previous tool call.",
 	)
+}
+
+// notAuthorized is a hosted session whose grant this connection just revoked
+// with wanctl_logout. Every later request is answered 401 by the gate.
+func notAuthorized() *mcpapi.CallToolResult {
+	return mcpapi.NewToolResultError(
+		"NOT AUTHORIZED. This connection's OAuth grant was revoked. The user has to authorize the connector again in their AI host; there is nothing to call here.")
 }
 
 // --- auth tools ---
 
+// mcpLogin is the local (stdio) server's login: the portal's one-time code,
+// exchanged for a token saved in this machine's wanctl config, exactly as
+// `wanctl login` does. The hosted endpoint does not register it: its bearer is
+// the login.
 func mcpLogin(ctx context.Context, req mcpapi.CallToolRequest) (*mcpapi.CallToolResult, error) {
 	s := sessions.get(ctx)
-	// An OAuth bearer already is the login: the user did the browser trip when
-	// they authorized this client. Sending them to /enroll for a one-time code
-	// would be asking them to log in a second time to the same account.
-	if r, ok := s.(*remoteSession); ok && r.oauth {
-		return mcpapi.NewToolResultText(fmt.Sprintf(
-			"✓ 本连接已通过 OAuth 登录为 namespace %q，不需要再走 /enroll 取 code。直接调 wanctl_peers / wanctl_exec 即可。\n"+
-				"（授权是跟着这个连接器的访问令牌走的，不依赖 MCP 会话；要换账号或收回授权，去门户的访问令牌页吊销，或调 wanctl_logout。）",
-			r.namespace)), nil
-	}
 	code := reqStr(req, "code", "")
-	rebind := reqStr(req, "rebind", "")
-	if rebind != "" {
-		r, ok := s.(*remoteSession)
-		if !ok {
-			return mcpapi.NewToolResultError("rebind credentials are only supported by the hosted HTTP MCP; run wanctl_login() again."), nil
-		}
-		claim, err := openRebind(r.owner.seed, rebind, time.Now())
-		if err != nil {
-			return mcpapi.NewToolResultError("rebind credential is invalid, expired, revoked, or from the legacy format; run wanctl_login() again to re-authenticate via the portal."), nil
-		}
-		tr := config.EnvOr("WANCTL_TRANSPORT", config.DefaultTransport)
-		relayURL, err := s.relayURL()
-		if err != nil {
-			return mcpapi.NewToolResultError(err.Error()), nil
-		}
-		realNS, err := client.ResolveTokenNamespace(ctx, relayURL, claim.Token, tr)
-		if err != nil {
-			return mcpapi.NewToolResultError("rebind token was rejected by the Relay; run wanctl_login() again to re-authenticate."), nil
-		}
-		if realNS != claim.Namespace {
-			return mcpapi.NewToolResultError("rebind namespace does not match the Relay token owner; run wanctl_login() again to re-authenticate."), nil
-		}
-		if err := r.restoreLogin(claim, realNS, time.Now()); err != nil {
-			if errors.Is(err, ErrRevokedRebind) {
-				return mcpapi.NewToolResultError("rebind credential was revoked by logout; run wanctl_login() again to re-authenticate."), nil
-			}
-			return mcpapi.NewToolResultError(fmt.Sprintf("保存登录态失败: %s", err)), nil
-		}
-		return mcpapi.NewToolResultText(fmt.Sprintf("✓ 已用 rebind 凭证恢复到 namespace %q，并经 Relay 复核。可以继续之前的工具调用了。", realNS)), nil
-	}
 	portal, err := config.Portal()
 	if err != nil {
 		return mcpapi.NewToolResultError(err.Error()), nil
@@ -1068,32 +913,16 @@ func mcpLogin(ctx context.Context, req mcpapi.CallToolRequest) (*mcpapi.CallTool
 		return mcpapi.NewToolResultError(err.Error()), nil
 	}
 	en, err := client.ExchangeCode(ctx, relayURL, code)
-	token, ns := en.Token, en.Namespace
 	if err != nil {
 		return mcpapi.NewToolResultError(fmt.Sprintf("授权失败: %s\n请让用户回到 %s/enroll 拿一个新 code（旧的可能用过或过期了），然后再调一次 wanctl_login(code=\"…\")。", err, portal)), nil
 	}
-	var credential string
-	if r, ok := s.(*remoteSession); ok {
-		credential, err = r.saveLoginAndIssue(token, ns, time.Now())
-	} else {
-		err = s.saveLogin(token, ns)
-	}
-	if err != nil {
+	if err := config.SaveToken(en.Token); err != nil {
 		return mcpapi.NewToolResultError(fmt.Sprintf("保存登录态失败: %s", err)), nil
 	}
-	msg := fmt.Sprintf(
+	return mcpapi.NewToolResultText(fmt.Sprintf(
 		"✓ 已绑定到 namespace \"%s\". 现在可以调 wanctl_peers / wanctl_pair / wanctl_exec / wanctl_push / wanctl_pull / wanctl_logs 了。\n第一次拨某台设备没配对过的话有两种走法: (a) 直接 wanctl_exec — 会返回 'PAIRING REQUIRED' + 链接; (b) 想更友好,先 wanctl_pair(target=..) 拿到 URL 给用户. 不论走哪边,把链接原封不动给用户点开就行.",
-		ns,
-	)
-	// HTTP-MCP credentials are in-memory and keyed by Mcp-Session-Id, so a relay
-	// restart or a re-initialized connection can throw 'LOGIN REQUIRED' mid-task.
-	// Hand the AI a rebind credential so it can self-heal without re-OAuth (#1).
-	if credential != "" {
-		msg += fmt.Sprintf(
-			"\n\n⚠️ 给 AI 自己记(不必展示给用户): 保存下面这串 rebind 凭证。之后任何工具若返回 'LOGIN REQUIRED'(relay 重启/连接重置会触发,但用户其实仍有授权), 不要再打扰用户重新走浏览器登录 —— 直接调 wanctl_login(rebind=\"…\") 即可瞬时恢复:\n\n  %s",
-			credential)
-	}
-	return mcpapi.NewToolResultText(msg), nil
+		en.Namespace,
+	)), nil
 }
 
 func mcpStatus(ctx context.Context, _ mcpapi.CallToolRequest) (*mcpapi.CallToolResult, error) {
@@ -1102,14 +931,10 @@ func mcpStatus(ctx context.Context, _ mcpapi.CallToolRequest) (*mcpapi.CallToolR
 
 func mcpLogout(ctx context.Context, _ mcpapi.CallToolRequest) (*mcpapi.CallToolResult, error) {
 	s := sessions.get(ctx)
-	oauth := false
-	if r, ok := s.(*remoteSession); ok {
-		oauth = r.oauth
-	}
 	if err := s.clearLogin(); err != nil {
 		return mcpapi.NewToolResultError(err.Error()), nil
 	}
-	if oauth {
+	if hostedSession(s) {
 		return mcpapi.NewToolResultText(
 			"✓ 已吊销这份 OAuth 授权对应的中继令牌。这个连接器的后续调用会收到 401，再用需要用户在浏览器里重新授权一次。"), nil
 	}
@@ -1307,7 +1132,8 @@ func mcpExec(ctx context.Context, req mcpapi.CallToolRequest) (*mcpapi.CallToolR
 	if hint != nil {
 		return hint, nil
 	}
-	var stdout, stderr bytes.Buffer
+	// Only what can be returned is kept, as it arrives; see outputKeeper.
+	stdout, stderr := keepTail(), keepEnds()
 	res, err := c.ExecOut(ctx, client.ExecRequest{
 		Target:  target,
 		Command: command,
@@ -1320,7 +1146,7 @@ func mcpExec(ctx context.Context, req mcpapi.CallToolRequest) (*mcpapi.CallToolR
 		// and it is the difference between "the error was in the middle of 3 MB
 		// you cannot see" and one grep.
 		SpillAfter: maxExecStream,
-	}, &stdout, &stderr)
+	}, stdout, stderr)
 	if err != nil {
 		hint := dialErrorResult(sess, err)
 		if res.SpillPath != "" {
@@ -1330,29 +1156,29 @@ func mcpExec(ctx context.Context, req mcpapi.CallToolRequest) (*mcpapi.CallToolR
 		return hint, nil
 	}
 	code := res.Code
-	stdoutText, stderrText := tailStream(stdout.Bytes(), res), clampStream(stderr.Bytes())
+	stdoutText, stderrText := stdout.tailText(res), stderr.clampText()
 	out := fmt.Sprintf("exit: %d\n", code)
-	if stdout.Len() > 0 {
+	if stdout.total > 0 {
 		s := stdoutText
 		out += "\n--- stdout ---\n" + s
 		if !strings.HasSuffix(s, "\n") {
 			out += "\n"
 		}
 	}
-	if stderr.Len() > 0 {
+	if stderr.total > 0 {
 		s := stderrText
 		out += "\n--- stderr ---\n" + s
 		if !strings.HasSuffix(s, "\n") {
 			out += "\n"
 		}
 	}
-	if stdout.Len() == 0 && stderr.Len() == 0 {
+	if stdout.total == 0 && stderr.total == 0 {
 		out += "(no output)\n"
 	}
 	data := map[string]any{
 		"target": target, "done": true, "code": code,
 		"stdout": stdoutText, "stderr": stderrText,
-		"stdout_truncated": stdout.Len() > maxExecStream, "stderr_truncated": stderr.Len() > maxExecStream,
+		"stdout_truncated": stdout.total > maxExecStream, "stderr_truncated": stderr.total > maxExecStream,
 	}
 	if res.SpillPath != "" {
 		data["spill_path"] = res.SpillPath
@@ -1669,8 +1495,8 @@ func mcpExecPoll(ctx context.Context, req mcpapi.CallToolRequest) (*mcpapi.CallT
 	if hint != nil {
 		return hint, nil
 	}
-	var buf bytes.Buffer
-	newOffset, running, code, err := c.ExecPollTo(ctx, target, jobID, int64(reqInt(req, "offset")), &buf)
+	buf := keepEnds()
+	newOffset, running, code, err := c.ExecPollTo(ctx, target, jobID, int64(reqInt(req, "offset")), buf)
 	if err != nil {
 		return dialErrorResult(sess, err), nil
 	}
@@ -1679,8 +1505,8 @@ func mcpExecPoll(ctx context.Context, req mcpapi.CallToolRequest) (*mcpapi.CallT
 		head = fmt.Sprintf("state: done\nexit: %d\nnext_offset: %d\n", code, newOffset)
 	}
 	out := head
-	if buf.Len() > 0 {
-		out += "\n--- new output ---\n" + clampStream(buf.Bytes())
+	if buf.total > 0 {
+		out += "\n--- new output ---\n" + buf.clampText()
 	} else {
 		out += "\n(no new output since offset)\n"
 	}
@@ -1690,7 +1516,7 @@ func mcpExecPoll(ctx context.Context, req mcpapi.CallToolRequest) (*mcpapi.CallT
 	}
 	data := map[string]any{
 		"target": target, "job_id": jobID, "state": state, "done": !running,
-		"output": clampStream(buf.Bytes()), "next_offset": newOffset, "truncated": buf.Len() > maxExecStream,
+		"output": buf.clampText(), "next_offset": newOffset, "truncated": buf.total > maxExecStream,
 	}
 	if !running {
 		data["code"] = code
@@ -1859,7 +1685,7 @@ func mcpID(ctx context.Context, _ mcpapi.CallToolRequest) (*mcpapi.CallToolResul
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if r.token == "" {
-			return mcpapi.NewToolResultText("not logged in — call wanctl_login first; identity is derived from your namespace once you do."), nil
+			return notAuthorized(), nil
 		}
 		if err := r.ensureIdentity(); err != nil {
 			return mcpapi.NewToolResultError("derive identity: " + err.Error()), nil
@@ -1987,7 +1813,61 @@ func mcpRules(ctx context.Context, _ mcpapi.CallToolRequest) (*mcpapi.CallToolRe
 // holds the result/error the caller is after).
 const maxExecStream = 48 * 1024
 
-// tailStream is what a synchronous exec returns when its output does not fit.
+// clampHead is how much of the start of a stream clampText keeps; the rest of
+// maxExecStream goes to the end, where a command's result usually is.
+const clampHead = 8 * 1024
+
+// outputKeeper holds what a caller will be shown of one output stream while
+// the stream is still arriving: its first headN bytes, its last tailN, and a
+// count of all of it. How much a device sends is the device's choice — a
+// command can print without end, and nothing obliges an agent to honour
+// SpillAfter — so nothing here grows with the output. The server used to
+// collect each stream whole and cut it down when the command ended, holding
+// everything a device sent until then.
+type outputKeeper struct {
+	headN, tailN int
+	head, tail   []byte
+	total        int64
+}
+
+// keepTail keeps what tailText shows: the last maxExecStream bytes.
+func keepTail() *outputKeeper { return &outputKeeper{tailN: maxExecStream} }
+
+// keepEnds keeps what clampText shows: the first clampHead bytes and the last
+// maxExecStream-clampHead.
+func keepEnds() *outputKeeper {
+	return &outputKeeper{headN: clampHead, tailN: maxExecStream - clampHead}
+}
+
+// Write never fails and keeps at most headN + 2*tailN bytes: the tail buffer
+// runs to twice its size before it is shifted down, so the copy happens once
+// per tailN bytes of output rather than on every write.
+func (k *outputKeeper) Write(p []byte) (int, error) {
+	n := len(p)
+	k.total += int64(n)
+	if room := k.headN - len(k.head); room > 0 {
+		take := min(room, len(p))
+		k.head = append(k.head, p[:take]...)
+		p = p[take:]
+	}
+	if len(p) > k.tailN {
+		p = p[len(p)-k.tailN:]
+	}
+	if len(k.tail)+len(p) > 2*k.tailN {
+		keep := k.tailN - len(p) // with p appended, exactly tailN remain
+		k.tail = append(k.tail[:0], k.tail[len(k.tail)-keep:]...)
+	}
+	k.tail = append(k.tail, p...)
+	return n, nil
+}
+
+// last is the stream's final tailN bytes, or all of what followed the head
+// when there were fewer.
+func (k *outputKeeper) last() []byte {
+	return k.tail[max(0, len(k.tail)-k.tailN):]
+}
+
+// tailText is what a synchronous exec returns for stdout (a keepTail keeper).
 //
 // It keeps the END of the output, not the beginning and the end. A command's
 // result is at the end: the compiler's error summary, the test run's failures,
@@ -1996,16 +1876,16 @@ const maxExecStream = 48 * 1024
 // the head is one grep away and the tail is what the caller needs in front of
 // it. deviceCopy names that file, so the next call is `grep` and not the same
 // command again with a filter guessed blind.
-func tailStream(b []byte, res client.ExecOutcome) string {
-	if len(b) <= maxExecStream {
-		return string(b)
+func (k *outputKeeper) tailText(res client.ExecOutcome) string {
+	if k.total <= maxExecStream {
+		return string(k.head) + string(k.tail)
 	}
-	tail := b[len(b)-maxExecStream:]
-	// The device counted every byte it produced; this buffer holds only what
+	tail := k.last()
+	// The device counted every byte it produced; this keeper counted only what
 	// arrived on one stream. When the two disagree the device's number is the
 	// true one, and it is the number a caller reasons about when deciding
 	// whether the tail is worth reading at all.
-	total := int64(len(b))
+	total := k.total
 	if res.SpillBytes > total {
 		total = res.SpillBytes
 	}
@@ -2035,20 +1915,22 @@ func spillNote(res client.ExecOutcome) string {
 	}
 }
 
-func clampStream(b []byte) string {
-	if len(b) <= maxExecStream {
-		return string(b)
+// clampText is what stderr and polled output return (a keepEnds keeper): all
+// of it when it fits, otherwise its start and its end around a line saying how
+// much was cut.
+func (k *outputKeeper) clampText() string {
+	if k.total <= maxExecStream {
+		return string(k.head) + string(k.tail)
 	}
-	const headN = 8 * 1024
-	tailN := maxExecStream - headN
-	dropped := len(b) - headN - tailN
+	tail := k.last()
+	dropped := k.total - int64(len(k.head)) - int64(len(tail))
 	var sb strings.Builder
-	sb.Write(b[:headN])
+	sb.Write(k.head)
 	sb.WriteString(fmt.Sprintf(
 		"\n\n[... wanctl truncated %d bytes (%d total); showing first %d + last %d. "+
 			"Re-run with a tighter filter, e.g. `... | Select-Object -Last 200` or `... | tail -n 200` ...]\n\n",
-		dropped, len(b), headN, tailN))
-	sb.Write(b[len(b)-tailN:])
+		dropped, k.total, len(k.head), len(tail)))
+	sb.Write(tail)
 	return sb.String()
 }
 

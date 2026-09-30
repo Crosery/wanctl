@@ -8,7 +8,7 @@ Variables marked "conditional" are required only for the feature described.
 
 | Variable | Role | Required | Default | Purpose |
 |---|---|---:|---|---|
-| `WANCTL_ROLE` | container | No | `relay` | Docker image command: `relay`, `portal`, or `mcp`. |
+| `WANCTL_ROLE` | container | No | `relay` | Docker image command: `relay` or `portal`. The hosted MCP endpoint is part of the relay; the `mcp` role was removed in v0.19.0. |
 | `DATABASE_URL` | relay | Conditional | none | PostgreSQL DSN. Required for the portal-backed multi-user deployment; otherwise relay needs `WANCTL_TOKENS` or `WANCTL_UPSTREAM_RELAY`. |
 | `WANCTL_AUTO_MIGRATE` | relay | No | enabled | Set to `0` to skip embedded database migrations. |
 | `WANCTL_ADMIN_SECRET` | relay, portal, admin CLI | Conditional | none | Shared secret for `/admin/*`; relay startup requires at least 32 bytes when set. Required for a functional portal, upstream token resolution, admin CLI, and server-log access. |
@@ -17,7 +17,7 @@ Variables marked "conditional" are required only for the feature described.
 | `WANCTL_PORTAL_NS` | relay | No | none | Namespace allowed to open privileged portal console sessions. Conventionally `portal`. |
 | `WANCTL_DIST_DIR` | relay | No | `/dist` | Directory containing signed release artifacts and installers. |
 | `WANCTL_PUBLIC_ORIGIN` | relay | Conditional | none | Canonical relay origin substituted into `/skills` and into the installers served from `/install.sh` and `/install.ps1`, so a script fetched from this relay installs from this relay. It is also the issuer and the resource identifier the MCP OAuth flow publishes. Never derived from request Host: `/skills` returns 503 when unset, the installers are served with their built-in base untouched, and OAuth stays off. |
-| `WANCTL_MCP_SEED` | relay, MCP | Conditional | none | Hex seed enabling `/mcp` (alias `/wanctl-mcp`) on relay; required and at least 32 decoded bytes for standalone `mcp --http`. It seals rebind credentials and OAuth access tokens, so changing it signs every hosted session out at once. |
+| `WANCTL_MCP_SEED` | relay | Conditional | none | Hex seed, at least 32 decoded bytes, enabling the hosted MCP endpoint `/mcp` (alias `/wanctl-mcp`) on the relay. Since v0.19.0 the endpoint authenticates with OAuth only, so it also needs `DATABASE_URL`, `WANCTL_PUBLIC_ORIGIN` and `WANCTL_PORTAL`; without them `/mcp` answers 503 naming what is missing. It seals OAuth access tokens and stored grants, so changing it voids every authorization at once. |
 | `WANCTL_MCP_LOCAL_ROOT` | MCP stdio | No | process working directory | Only local tree `wanctl_push` and `wanctl_pull` may access. The wanctl config directory is always excluded. |
 | `WANCTL_MCP_ALLOWED_ORIGINS` | MCP HTTP | No | none | Comma-separated browser Origin allowlist. Requests with an Origin are denied unless listed; programmatic clients normally send none. |
 | `WANCTL_MCP_ALLOW_UNSAFE_TRUST_SERVER` | MCP | No | `0` | Set to `1` only to restore model-callable device TOFU pinning. Default is fail-closed because the model cannot distinguish an independently verified fingerprint from one supplied by a hostile relay. |
@@ -31,6 +31,10 @@ Variables marked "conditional" are required only for the feature described.
 | `WANCTL_GITHUB_PROXY` | portal | No | none | HTTP(S) or SOCKS5 proxy for GitHub token/user requests only. Relay and other outbound traffic are unaffected. |
 | `WANCTL_GITHUB_AUTH_BASE` | portal | No | `https://github.com` | OAuth authorization/token base URL; useful for GitHub Enterprise. |
 | `WANCTL_GITHUB_API_BASE` | portal | No | `https://api.github.com` | GitHub user API base URL; useful for GitHub Enterprise. |
+| `WANCTL_SMTP_ADDR` | portal | No | none | SMTP `host:port`; mail is enabled only with all four mail variables set. Port 465 uses implicit TLS; other ports require STARTTLS (typically 587). Plaintext authentication and delivery are refused. Overall timeout: 15 seconds per message. |
+| `WANCTL_SMTP_USER` | portal | Conditional | none | SMTP username; uses PLAIN authentication. |
+| `WANCTL_SMTP_PASSWORD` | portal | Conditional | none | SMTP password. |
+| `WANCTL_MAIL_FROM` | portal | Conditional | none | RFC 5322 sender, e.g. `wanctl <wanctl@portal.example.com>`. With mail enabled and GitHub sign-in, every signed-in account must confirm a contact email before using the portal or requesting access: the portal mails a link (valid 24 hours, single use, at most 5 per account per day and one per address per 10 minutes) and the address takes effect when the page behind it is submitted. GitHub is not asked for any email permission. Approvals send an asynchronous Chinese/English notification to the confirmed address; declines send none and mail failures do not undo approval. |
 | `PORTAL_USER_HEADER` | portal | Conditional | `X-Auth-Request-Email` | Trusted reverse-proxy identity header for header-auth mode. The proxy must strip client-supplied copies. Mutually exclusive with GitHub OAuth. |
 | `PORTAL_PUBLIC_ORIGIN` | portal | No | derived from request | External portal origin used for OAuth redirects and secure cookies. Set it when TLS terminates at a proxy. |
 | `PORTAL_DEBUG_WHOAMI` | portal | No | `0` | Set to `1` to enable the diagnostic `/whoami` endpoint. Do not enable routinely. |

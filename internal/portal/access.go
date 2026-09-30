@@ -1,8 +1,11 @@
 package portal
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -33,6 +36,9 @@ type accessStatus struct {
 	Status   string     `json:"status"`
 	CanApply bool       `json:"can_apply"`
 	RetryAt  *time.Time `json:"retry_at,omitempty"`
+	// EmailHint is the masked address an approval would be mailed to; the
+	// relay never hands the portal the address itself on this path.
+	EmailHint string `json:"email_hint,omitempty"`
 }
 
 // accessStatusFor asks the relay about one principal's own application.
@@ -54,7 +60,9 @@ func (s *Server) accessStatusFor(p *principal) (accessStatus, error) {
 }
 
 // handleAccessRequest files an application on behalf of the signed-in
-// applicant. Only the note comes from the client.
+// applicant. Only the note comes from the client; the address an approval is
+// mailed to is the applicant's confirmed contact address, which the door in
+// front of this form made sure exists.
 func (s *Server) handleAccessRequest(w http.ResponseWriter, r *http.Request) {
 	if !s.oauthEnabled() {
 		http.NotFound(w, r)
@@ -67,9 +75,26 @@ func (s *Server) handleAccessRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	// Someone who already has a namespace has nothing to apply for, and an
 	// application from them would sit in the queue forever.
-	if _, _, status, _ := s.resolveNamespace(p, ""); status == resolveOK {
+	switch _, _, status, _ := s.resolveNamespace(p); status {
+	case resolveOK, resolveNeedsEmail:
 		http.Error(w, "already admitted", http.StatusConflict)
 		return
+	case resolveDisabled:
+		http.Error(w, accountDisabledBody, http.StatusForbidden)
+		return
+	}
+	// Checked here, not only by the page's redirect: the form is one POST
+	// away from anyone with a session. A relay that cannot say fails closed.
+	if s.emailGate() {
+		c, err := s.contactFor(p)
+		if err != nil {
+			http.Error(w, "relay unreachable", http.StatusBadGateway)
+			return
+		}
+		if c.confirmed() == "" {
+			http.Error(w, emailRequiredBody, http.StatusForbidden)
+			return
+		}
 	}
 	var in struct {
 		Note string `json:"note"`
@@ -127,5 +152,31 @@ func (s *Server) handleAccessDecide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK && strings.EqualFold(strings.TrimSpace(in.Decision), "approved") && s.mailEnabled() {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "relay response incomplete", http.StatusBadGateway)
+			return
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		var request struct {
+			ID     int    `json:"id"`
+			Login  string `json:"login"`
+			Email  string `json:"email"`
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(body, &request) == nil && request.Status == "approved" && request.Email != "" {
+			origin := s.requestOrigin(r)
+			go func() {
+				message, err := approvalMail(request.Login, origin)
+				if err == nil {
+					err = s.mail.Send(request.Email, message)
+				}
+				if err != nil {
+					log.Printf("portal: approval mail request %d: %s", request.ID, mailError(err, request.Email))
+				}
+			}()
+		}
+	}
 	copyResp(w, resp)
 }

@@ -44,6 +44,7 @@ func (r *Relay) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/invites/revoke", r.adminInviteRevoke)
 	mux.HandleFunc("/admin/users", r.adminUsers)
 	mux.HandleFunc("/admin/users/lookup", r.adminUserLookup)
+	mux.HandleFunc("/admin/users/disable", r.adminAccountDisable)
 	mux.HandleFunc("/admin/friends", r.adminFriends)
 	mux.HandleFunc("/admin/friends/request", r.adminFriendRequest)
 	mux.HandleFunc("/admin/friends/accept", r.adminFriendAccept)
@@ -56,6 +57,7 @@ func (r *Relay) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/devices", r.adminDevices)
 	mux.HandleFunc("/admin/devices/alias", r.adminDeviceAlias)
 	mux.HandleFunc("/admin/devices/lark", r.adminDevicesLark)
+	mux.HandleFunc("/admin/approval-phone", r.adminApprovalPhone)
 	mux.HandleFunc("/admin/devices/notify", r.adminDeviceNotify)
 	mux.HandleFunc("/admin/notify", r.adminNotify)
 	mux.HandleFunc("/admin/notify/test", r.adminNotifyTest)
@@ -191,12 +193,11 @@ func (r *Relay) adminResolveUser(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	var body struct {
-		Identity   string `json:"identity"`
-		Provider   string `json:"provider"`
-		Subject    string `json:"subject"`
-		Login      string `json:"login"`
-		Name       string `json:"name"`
-		InviteCode string `json:"invite_code"`
+		Identity string `json:"identity"`
+		Provider string `json:"provider"`
+		Subject  string `json:"subject"`
+		Login    string `json:"login"`
+		Name     string `json:"name"`
 	}
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
@@ -207,12 +208,17 @@ func (r *Relay) adminResolveUser(w http.ResponseWriter, req *http.Request) {
 		body.Subject = body.Identity
 	}
 	ns, role, err := r.admin.ResolveIdentity(
-		body.Provider, body.Subject, body.Login, body.Name, body.InviteCode, r.portalNS,
+		body.Provider, body.Subject, body.Login, body.Name, r.portalNS,
 	)
 	if err != nil {
 		if errors.Is(err, ErrPendingInvite) {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = io.WriteString(w, "pending-invite")
+			return
+		}
+		if errors.Is(err, ErrAccountDisabled) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, accountDisabledBody)
 			return
 		}
 		if errors.Is(err, ErrNamespaceConflict) {
@@ -222,7 +228,14 @@ func (r *Relay) adminResolveUser(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]string{"namespace": ns, "role": role})
+	// The portal turns people without a confirmed contact address away at
+	// its door; answering here saves it a second round trip on every call.
+	contact, err := r.admin.ContactEmail(strings.ToLower(strings.TrimSpace(body.Provider)), strings.TrimSpace(body.Subject))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"namespace": ns, "role": role, "email_confirmed": contact.ConfirmedAt != nil})
 }
 
 func (r *Relay) requireAdminStore(w http.ResponseWriter, req *http.Request) bool {
@@ -250,13 +263,13 @@ func (r *Relay) adminInvites(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
 		}
-		invite, code, err := r.admin.CreateInvite(body.GitHubLogin)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		invite, err := r.admin.CreateInvite(body.GitHubLogin)
+		if errors.Is(err, ErrInviteLogin) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if code != "" {
-			writeJSON(w, map[string]any{"id": invite.ID, "code": code})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, map[string]any{"id": invite.ID, "github_login": invite.GitHubLogin})
@@ -508,6 +521,8 @@ func (r *Relay) adminDeviceRemove(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Its shares went with it.
+	r.closeRevokedShares(body.Namespace)
 	// Evict any live registry entry so it disappears immediately.
 	key := body.Namespace + "/" + body.Device
 	r.hmu.Lock()
@@ -618,6 +633,9 @@ func (r *Relay) adminACLManage(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "no live share of that device with that namespace", http.StatusNotFound)
 		return
 	}
+	if !body.Manage {
+		r.closeRevokedShares(body.Namespace)
+	}
 	writeJSON(w, map[string]any{"device": device, "grantee": body.Grantee, "manage": body.Manage})
 }
 
@@ -635,6 +653,7 @@ func (r *Relay) adminACLRevoke(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	r.closeRevokedShares(body.Namespace)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -656,8 +675,8 @@ func (r *Relay) adminAudit(w http.ResponseWriter, req *http.Request) {
 // AdminStore is the DB surface the admin endpoints need.
 type AdminStore interface {
 	ResolveUser(identity string) (string, error)
-	ResolveIdentity(provider, subject, login, name, inviteCode, reservedNS string) (ns, role string, err error)
-	CreateInvite(githubLogin string) (Invite, string, error)
+	ResolveIdentity(provider, subject, login, name, reservedNS string) (ns, role string, err error)
+	CreateInvite(githubLogin string) (Invite, error)
 	ListInvites() ([]Invite, error)
 	RevokeInvite(id int) (bool, error)
 	UpsertDevice(namespace, name, fingerprint string)
@@ -674,6 +693,13 @@ type AdminStore interface {
 	LatestAccessRequest(provider, subject string) (AccessRequest, bool, error)
 	ListAccessRequests() ([]AccessRequest, error)
 	DecideAccessRequest(id int, status, decidedBy string) (AccessRequest, bool, error)
+	ContactEmail(provider, subject string) (ContactEmail, error)
+	IssueEmailConfirmation(provider, subject, login, address, next string) (EmailConfirmation, string, error)
+	MarkEmailConfirmationSent(id int) error
+	FailEmailConfirmation(id int) error
+	CancelEmailConfirmations(provider, subject string) error
+	PeekEmailConfirmation(token string) (EmailConfirmation, error)
+	ConfirmEmail(token string) (EmailConfirmation, error)
 	FriendRequest(requester, addressee, reservedNS string) (string, error)
 	FriendAccept(namespace, requester string) error
 	FriendDecline(namespace, requester string) error
@@ -717,6 +743,10 @@ var ErrNamespaceConflict = errors.New("derived namespace is already owned by ano
 // ErrPendingInvite means a GitHub identity has not been admitted yet.
 var ErrPendingInvite = errors.New("pending-invite")
 
+// ErrInviteLogin is an invite without a usable GitHub login. Invites are bound
+// to the login that will sign in; one-time codes were retired in v0.17.0.
+var ErrInviteLogin = errors.New("invite needs a GitHub login")
+
 // Invite is the public representation of an admission invitation. It never
 // contains the stored code hash or a raw invite code.
 type Invite struct {
@@ -734,13 +764,13 @@ type identityQuerier interface {
 
 // ResolveUser maps an SSO identity to a namespace, creating/linking the row.
 func (p *PGStore) ResolveUser(identity string) (string, error) {
-	ns, _, err := p.ResolveIdentity("header", identity, "", "", "", "")
+	ns, _, err := p.ResolveIdentity("header", identity, "", "", "")
 	return ns, err
 }
 
 // ResolveIdentity maps an immutable provider identity to a namespace, creating
 // the user when the provider's admission policy permits it.
-func (p *PGStore) ResolveIdentity(provider, subject, login, name, inviteCode, reservedNS string) (string, string, error) {
+func (p *PGStore) ResolveIdentity(provider, subject, login, name, reservedNS string) (string, string, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	subject = strings.TrimSpace(subject)
 	login = strings.TrimSpace(login)
@@ -750,6 +780,13 @@ func (p *PGStore) ResolveIdentity(provider, subject, login, name, inviteCode, re
 	}
 
 	if ns, role, err := lookupIdentity(p.db, provider, subject); err == nil {
+		// Asked on every portal request as well as at login, so a disabled
+		// account's session stops here too, not only its next sign-in.
+		if at, _, err := p.AccountDisabled(ns); err != nil {
+			return "", "", err
+		} else if at != nil {
+			return "", "", ErrAccountDisabled
+		}
 		return ns, role, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return "", "", err
@@ -773,7 +810,7 @@ func (p *PGStore) ResolveIdentity(provider, subject, login, name, inviteCode, re
 		if err := guardNamespace(preferredNS, reservedNS); err != nil {
 			return "", "", err
 		}
-		return p.resolveGitHubIdentity(subject, preferredNS, name, inviteCode)
+		return p.resolveGitHubIdentity(subject, preferredNS, name)
 	default:
 		return "", "", fmt.Errorf("unsupported identity provider %q", provider)
 	}
@@ -813,7 +850,7 @@ func insertIdentity(q identityQuerier, provider, subject, namespace, name, role 
 	return insertedNS, insertedRole, err
 }
 
-func (p *PGStore) resolveGitHubIdentity(subject, namespace, name, inviteCode string) (ns, role string, err error) {
+func (p *PGStore) resolveGitHubIdentity(subject, namespace, name string) (ns, role string, err error) {
 	tx, err := p.db.Begin()
 	if err != nil {
 		return "", "", err
@@ -842,31 +879,19 @@ func (p *PGStore) resolveGitHubIdentity(subject, namespace, name, inviteCode str
 	inviteID := 0
 	role = "admin"
 	if hasAdmin {
+		// An invite is bound to a GitHub login: the administrator's, or the one
+		// an approved access request wrote. There is no code to present.
 		role = "user"
-		if inviteCode != "" {
-			err = tx.QueryRow(
-				`SELECT id FROM invites WHERE code_hash = $1 AND used_at IS NULL FOR UPDATE`,
-				HashToken(inviteCode),
-			).Scan(&inviteID)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return "", "", err
-			}
-		}
-		if inviteID == 0 {
-			err = tx.QueryRow(
-				`SELECT id FROM invites
-				  WHERE lower(github_login) = lower($1) AND used_at IS NULL
-				  FOR UPDATE`, namespace,
-			).Scan(&inviteID)
-		}
+		err = tx.QueryRow(
+			`SELECT id FROM invites
+			  WHERE lower(github_login) = lower($1) AND used_at IS NULL
+			  FOR UPDATE`, namespace,
+		).Scan(&inviteID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", "", ErrPendingInvite
 		}
 		if err != nil {
 			return "", "", err
-		}
-		if inviteID == 0 {
-			return "", "", ErrPendingInvite
 		}
 	}
 
@@ -941,30 +966,20 @@ func decimalString(value string) bool {
 	return true
 }
 
-func (p *PGStore) CreateInvite(githubLogin string) (Invite, string, error) {
+func (p *PGStore) CreateInvite(githubLogin string) (Invite, error) {
 	githubLogin = strings.ToLower(strings.TrimSpace(githubLogin))
 	var invite Invite
-	var code string
-	if githubLogin != "" {
-		if !validGitHubLogin(githubLogin) {
-			return invite, "", fmt.Errorf("invalid GitHub login %q", githubLogin)
-		}
-		err := p.db.QueryRow(
-			`INSERT INTO invites (github_login) VALUES ($1)
-			 RETURNING id, github_login, created_at`, githubLogin,
-		).Scan(&invite.ID, &invite.GitHubLogin, &invite.CreatedAt)
-		return invite, "", err
+	if githubLogin == "" {
+		return invite, fmt.Errorf("%w: a GitHub login is required", ErrInviteLogin)
 	}
-	code = "winv_" + randHex(12)
+	if !validGitHubLogin(githubLogin) {
+		return invite, fmt.Errorf("%w: invalid GitHub login %q", ErrInviteLogin, githubLogin)
+	}
 	err := p.db.QueryRow(
-		`INSERT INTO invites (code_hash) VALUES ($1)
-		 RETURNING id, created_at`, HashToken(code),
-	).Scan(&invite.ID, &invite.CreatedAt)
-	if err != nil {
-		return Invite{}, "", err
-	}
-	invite.HasCode = true
-	return invite, code, nil
+		`INSERT INTO invites (github_login) VALUES ($1)
+		 RETURNING id, github_login, created_at`, githubLogin,
+	).Scan(&invite.ID, &invite.GitHubLogin, &invite.CreatedAt)
+	return invite, err
 }
 
 func (p *PGStore) ListInvites() ([]Invite, error) {
@@ -1179,6 +1194,9 @@ func (p *PGStore) RemoveDevice(namespace, device string) error {
 		return err
 	}
 	_, _ = p.db.Exec(`DELETE FROM acl WHERE owner_namespace=$1 AND device=$2`, namespace, device)
+	// A designation must not outlive its device: a later enrollment under the
+	// same name would otherwise inherit the power to approve (ADR 0015).
+	_, _ = p.db.Exec(`DELETE FROM approval_phone WHERE namespace=$1 AND device=$2`, namespace, device)
 	return nil
 }
 

@@ -7,7 +7,7 @@
 
 | 变量 | 角色 | 必需 | 默认值 | 用途 |
 |---|---|---:|---|---|
-| `WANCTL_ROLE` | 容器 | 否 | `relay` | Docker 镜像的启动角色：`relay`、`portal` 或 `mcp`。 |
+| `WANCTL_ROLE` | 容器 | 否 | `relay` | Docker 镜像的启动角色：`relay` 或 `portal`。托管 MCP 端点是 relay 的一部分；`mcp` 角色在 v0.19.0 删掉了。 |
 | `DATABASE_URL` | relay | 视情况 | 无 | PostgreSQL DSN。带门户的多用户部署必需；否则 relay 需要 `WANCTL_TOKENS` 或 `WANCTL_UPSTREAM_RELAY`。 |
 | `WANCTL_AUTO_MIGRATE` | relay | 否 | 开启 | 设成 `0` 可跳过内嵌的数据库 migration。 |
 | `WANCTL_ADMIN_SECRET` | relay、portal、管理 CLI | 视情况 | 无 | `/admin/*` 的共享 secret；设了的话 relay 启动时要求至少 32 字节。门户可用、上游令牌解析、管理 CLI 和服务端日志访问都需要它。 |
@@ -16,7 +16,7 @@
 | `WANCTL_PORTAL_NS` | relay | 否 | 无 | 允许开启特权门户控制台会话的命名空间。惯例是 `portal`。 |
 | `WANCTL_DIST_DIR` | relay | 否 | `/dist` | 存放签名过的发布产物和安装器的目录。 |
 | `WANCTL_PUBLIC_ORIGIN` | relay | 视情况 | 无 | relay 的规范 origin，会被替换进 `/skills`，以及从 `/install.sh` 和 `/install.ps1` 提供的安装器里，这样从这台 relay 取到的脚本就从这台 relay 安装。它同时也是 MCP OAuth 对外公布的 issuer 和资源标识。绝不从请求的 Host 推导：没设时 `/skills` 返回 503，安装器原样带着它内置的 base 提供，OAuth 则保持关闭。 |
-| `WANCTL_MCP_SEED` | relay、MCP | 视情况 | 无 | 十六进制种子，在 relay 上启用 `/mcp`（别名 `/wanctl-mcp`）；独立跑 `mcp --http` 时必需，且解码后至少 32 字节。它同时密封 rebind 凭证和 OAuth 访问令牌，所以换掉它等于让所有托管会话立刻登出。 |
+| `WANCTL_MCP_SEED` | relay | 视情况 | 无 | 十六进制种子，解码后至少 32 字节，在 relay 上启用托管 MCP 端点 `/mcp`（别名 `/wanctl-mcp`）。v0.19.0 起这个端点只认 OAuth，所以还需要 `DATABASE_URL`、`WANCTL_PUBLIC_ORIGIN` 和 `WANCTL_PORTAL`；缺了的话 `/mcp` 回 503 并说明缺什么。它密封 OAuth 访问令牌和存下来的授权，所以换掉它等于让所有授权立刻作废。 |
 | `WANCTL_MCP_LOCAL_ROOT` | MCP stdio | 否 | 进程工作目录 | `wanctl_push` 和 `wanctl_pull` 唯一可以访问的本地目录树。wanctl 配置目录永远被排除在外。 |
 | `WANCTL_MCP_ALLOWED_ORIGINS` | MCP HTTP | 否 | 无 | 逗号分隔的浏览器 Origin 白名单。带 Origin 的请求不在名单里就拒绝；程序化的客户端通常一个都不带。 |
 | `WANCTL_MCP_ALLOW_UNSAFE_TRUST_SERVER` | MCP | 否 | `0` | 只有想恢复「模型可调用的设备 TOFU 钉扎」时才设成 `1`。默认是失败即关闭，因为模型分不清一个独立验证过的指纹和一个由敌意 relay 递过来的指纹。 |
@@ -30,6 +30,10 @@
 | `WANCTL_GITHUB_PROXY` | 门户 | 否 | 无 | 仅用于 GitHub 令牌交换和用户接口的 HTTP(S) 或 SOCKS5 代理，不改变 relay 或其他请求的路由。 |
 | `WANCTL_GITHUB_AUTH_BASE` | portal | 否 | `https://github.com` | OAuth 授权/令牌的基址；GitHub Enterprise 用得上。 |
 | `WANCTL_GITHUB_API_BASE` | portal | 否 | `https://api.github.com` | GitHub 用户 API 的基址；GitHub Enterprise 用得上。 |
+| `WANCTL_SMTP_ADDR` | portal | 否 | 无 | SMTP `host:port`；与下面三项全部设置后启用邮件。465 使用隐式 TLS，其他端口必须支持 STARTTLS（通常用 587），拒绝明文认证或发送。每封邮件总超时 15 秒。 |
+| `WANCTL_SMTP_USER` | portal | 条件必需 | 无 | SMTP 用户名；使用 PLAIN 认证。 |
+| `WANCTL_SMTP_PASSWORD` | portal | 条件必需 | 无 | SMTP 密码。 |
+| `WANCTL_MAIL_FROM` | portal | 条件必需 | 无 | RFC 5322 发件地址，例如 `wanctl <wanctl@portal.example.com>`。启用邮件且使用 GitHub 登录时，每个登录的账号要先确认一个联系邮箱，才能进门户或提交访问申请：门户发一封确认信（链接 24 小时有效、只能用一次；每个账号每天最多 5 封，同一地址 10 分钟一封），按下链接页上的确认后生效。不向 GitHub 申请邮箱权限。申请通过后异步给确认过的地址发中英双语通知；拒绝不发信，发送失败不撤销审批。 |
 | `PORTAL_USER_HEADER` | portal | 视情况 | `X-Auth-Request-Email` | header 认证模式下，来自可信反向代理的身份头。代理必须剥掉客户端自带的同名头。与 GitHub OAuth 互斥。 |
 | `PORTAL_PUBLIC_ORIGIN` | portal | 否 | 由请求推导 | 门户对外的 origin，用于 OAuth 重定向和安全 cookie。TLS 在代理上终结时要设。 |
 | `PORTAL_DEBUG_WHOAMI` | portal | 否 | `0` | 设成 `1` 打开诊断用的 `/whoami` 端点。不要常开。 |

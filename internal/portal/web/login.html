@@ -42,10 +42,18 @@
   </a>
 
   <!-- 授权一个 OAuth 应用是一次真实的权限授予。说清索取范围，是这一页
-       跟一封钓鱼邮件之间的差别。请求里没有 scope 参数，所以这句是真的。 -->
+       跟一封钓鱼邮件之间的差别。v0.18.0 起不再向 GitHub 要邮箱（user:email）：
+       邮箱登录后自己填、点确认信生效。配了邮件的实例把这一步也先说出来，
+       跟「邀请制」一样，不该等人授权完了才第一次知道。 -->
+  {{if .MailEnabled}}
+  <p class="fine"
+     data-en="No GitHub permissions are requested — only your public profile. Next, you'll confirm an email address, so we can reach you."
+     data-zh="不向 GitHub 申请任何权限，只读你的公开资料。登录后还要确认一个邮箱，用来联系你。">No GitHub permissions are requested — only your public profile. Next, you'll confirm an email address, so we can reach you.</p>
+  {{else}}
   <p class="fine"
      data-en="No GitHub permissions are requested — only your public profile."
      data-zh="不向 GitHub 申请任何权限，只读你的公开资料。">No GitHub permissions are requested — only your public profile.</p>
+  {{end}}
 </main>
 
 <script src="/assets/auth.js?v={{.V}}"></script>

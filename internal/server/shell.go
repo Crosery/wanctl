@@ -162,15 +162,18 @@ func (s *ShellSession) endOutput(cause error) {
 }
 
 // cancelNow is what a cancellation does: end the session's processes and stop
-// waiting on their output. The two are separate steps on purpose. Killing the
-// container does not guarantee the output pipe closes, because a descendant
-// that escaped the container still holds it, so the reader is cut here rather
-// than left to a copier that may never see EOF. That is also what makes a kill
-// that *failed* reach the caller immediately instead of when the command it
-// could not stop happens to end.
+// waiting on them. The two are separate steps on purpose. Killing the container
+// does not guarantee either pipe closes, because a descendant that escaped the
+// container still holds both, and a kill can fail outright. So both waits are
+// cut here: the reader, which a copier that never sees EOF would otherwise feed
+// forever, and stdin, where a command larger than the pipe sits blocked in
+// writeCommand behind a shell that has stopped reading (#112). That is also what
+// makes a kill that *failed* reach the caller immediately instead of when the
+// command it could not stop happens to end.
 func (s *ShellSession) cancelNow() error {
 	s.closed.Store(true)
 	err := s.killContainer()
+	s.stdin.Close()
 	s.endOutput(ErrSessionCancelled)
 	return err
 }
@@ -246,11 +249,15 @@ func NewShellSessionInDir(shell, cwd string) (*ShellSession, error) {
 		return abandon(err)
 	}
 	go func() {
+		// Wait for the shell alone, not cmd.Wait: that also waits for the
+		// output copiers, up to WaitDelay after the shell is gone when an
+		// escaped descendant holds stdout (#110). Reaping releases the shell's
+		// pid, and with it the process-group id that is the same number, so the
+		// container's one kill is spent now: it ends whatever the shell left in
+		// its group (#111), and nothing can signal that number later.
+		cmd.Process.Wait()
+		container.Kill()
 		cmd.Wait()
-		// Reaping releases the shell's pid, and with it the process-group id
-		// that is the same number. The container must stop using it at exactly
-		// this point, before anything can be given that number again.
-		container.reap()
 		pw.Close()
 	}()
 
@@ -420,6 +427,65 @@ func (s *ShellSession) changeDirLocked(cwd string, out io.Writer) (int, error) {
 		return -1, err
 	}
 	return s.execLocked(changeDirCommand(runtime.GOOS, path), out)
+}
+
+// CurrentDir reports the directory the session's shell is in now, as the shell
+// itself names it: the logical path its own pwd prints, so a session started in
+// or moved to a directory reports that same spelling back.
+//
+// The answer travels through a data file this process created, the same way a
+// cwd travels in (changeDirLocked), and never through the session's output
+// stream: a background job an earlier command started may still be writing to
+// that stream at any moment. A shell that cannot name its directory — the
+// directory was removed, the location is not a filesystem path — is an error,
+// never a guess.
+//
+// This is the shell's own account of itself. A command that was allowed to run
+// in the session can redefine what the shell does next, and this is no
+// exception; what it gets right is the ordinary case of a command having moved
+// the shell with cd.
+func (s *ShellSession) CurrentDir(ctx context.Context) (string, error) {
+	f, err := os.CreateTemp("", "wanctl-pwd-"+s.token+"-*")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+	code, err := s.ExecInDirContext(ctx, currentDirCommand(runtime.GOOS, path), "", io.Discard)
+	if err != nil {
+		return "", err
+	}
+	// Only the POSIX status belongs to this command. PowerShell's end marker
+	// reports $LASTEXITCODE, which still holds whatever native program an
+	// earlier command ran; there an empty file is the failure signal.
+	if code != 0 && runtime.GOOS != "windows" {
+		return "", fmt.Errorf("session shell could not name its directory (exit %d)", code)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	dir := string(b)
+	if runtime.GOOS != "windows" {
+		dir = strings.TrimSuffix(dir, "\n") // pwd's own terminator; a name may end in one too
+	}
+	if dir == "" {
+		return "", fmt.Errorf("session shell could not name its directory")
+	}
+	return dir, nil
+}
+
+// currentDirCommand is fixed protocol source that writes the shell's directory
+// into a data file generated locally. `command` keeps a shell function named
+// pwd out of it; PowerShell reads the location from the engine rather than
+// from Get-Location, which a script could redefine, and writes nothing when
+// the location is not on the filesystem.
+func currentDirCommand(goos, dataPath string) string {
+	if goos == "windows" {
+		return "$wanctlLoc=$ExecutionContext.SessionState.Path.CurrentLocation; if($wanctlLoc.Provider.Name -eq 'FileSystem'){[IO.File]::WriteAllText(" + quotePowerShellLiteral(dataPath) + ",$wanctlLoc.ProviderPath)}"
+	}
+	return "command pwd >| " + quotePOSIXLiteral(dataPath)
 }
 
 // Closed reports whether the session has been torn down. It takes no lock: the
