@@ -385,7 +385,7 @@
       {
         "name": "fingerprint",
         "type": "string",
-        "required": false
+        "required": true
       },
       {
         "name": "number",

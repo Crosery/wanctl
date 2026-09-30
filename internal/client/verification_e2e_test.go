@@ -125,17 +125,11 @@ func TestFirstContactOffersAVerificationCodeOnlyTheDeviceCanAnswer(t *testing.T)
 	if _, err := transport.NormalizeVerifyNumber(first.Number); err != nil {
 		t.Fatalf("verification number %q: %v", first.Number, err)
 	}
-	if _, err := transport.NormalizeVerifyCode(first.Code); err != nil {
-		t.Fatalf("verification code %q: %v", first.Code, err)
-	}
 	// What `wanctl verify <number>` prints on the device, computed from the
 	// certificate the dial was shown.
 	onDevice, err := transport.VerifyCode(first.Fingerprint, first.Number)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if onDevice != first.Code {
-		t.Fatalf("this controller derived %s, the device would print %s", first.Code, onDevice)
 	}
 	// The message a newcomer reads has to carry the next command, using the
 	// short form.
@@ -143,21 +137,24 @@ func TestFirstContactOffersAVerificationCodeOnlyTheDeviceCanAnswer(t *testing.T)
 	for _, want := range []string{
 		"DEVICE IDENTITY CONFIRMATION REQUIRED",
 		"verification number:  " + transport.GroupDigits(first.Number),
-		"verification code:    " + transport.GroupDigits(first.Code),
 		"wanctl verify " + first.Number,
-		"--number " + first.Number + " --code " + first.Code,
+		"--fingerprint \"" + first.Fingerprint + "\" --number " + first.Number,
+		"same refusal",
+		"--number " + first.Number + " --code <the code the device shows>",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("first-contact message is missing %q:\n%s", want, text)
 		}
 	}
 
+	assertNoDerivedCode(t, text, onDevice)
+
 	// A code the device never printed is refused, and pins nothing.
 	other := "000000000"
-	if first.Code == other {
+	if onDevice == other {
 		other = "111111111"
 	}
-	wrong := &TrustChallenge{Target: first.Target, Number: first.Number}
+	wrong := &TrustChallenge{Target: first.Target, Fingerprint: first.Fingerprint, Number: first.Number}
 	if _, _, err := r.client.ConfirmTrust(r.ctx, wrong, other, false); err == nil {
 		t.Fatal("a code that did not come off the device was accepted")
 	} else {
@@ -165,6 +162,7 @@ func TestFirstContactOffersAVerificationCodeOnlyTheDeviceCanAnswer(t *testing.T)
 		if !errors.As(err, &mismatch) {
 			t.Fatalf("wrong code: want VerifyCodeMismatchError, got %v", err)
 		}
+		assertNoDerivedCode(t, err.Error(), onDevice)
 		if !strings.Contains(err.Error(), "VERIFICATION CODE MISMATCH") {
 			t.Errorf("refusal is not matchable:\n%s", err)
 		}
@@ -174,7 +172,7 @@ func TestFirstContactOffersAVerificationCodeOnlyTheDeviceCanAnswer(t *testing.T)
 	}
 
 	// The code read off the device pins it, and the device is then drivable.
-	canonical, pinned, err := r.client.ConfirmTrust(r.ctx, wrong, first.Code, false)
+	canonical, pinned, err := r.client.ConfirmTrust(r.ctx, wrong, onDevice, false)
 	if err != nil {
 		t.Fatalf("confirm with the device's own code: %v", err)
 	}
@@ -205,7 +203,11 @@ func TestAChallengeConfirmsThroughANonCanonicalTarget(t *testing.T) {
 		t.Fatalf("first contact: want TrustRequiredError, got %v", err)
 	}
 	ch := &TrustChallenge{Target: "home-pc", Fingerprint: first.Fingerprint, Number: first.Number}
-	canonical, pinned, err := r.client.ConfirmTrust(r.ctx, ch, first.Code, false)
+	onDevice, err := transport.VerifyCode(first.Fingerprint, first.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, pinned, err := r.client.ConfirmTrust(r.ctx, ch, onDevice, false)
 	if err != nil {
 		t.Fatalf("confirm through a typed name: %v", err)
 	}
@@ -214,26 +216,25 @@ func TestAChallengeConfirmsThroughANonCanonicalTarget(t *testing.T) {
 	}
 }
 
-// The one-process flow: challenge, print the number, ask for the code, pin.
+// The two-process flow must stay bound to the certificate from the refusal.
 // The challenge binds the identity it was issued for, so a device that answers
 // with a different certificate after the human has compared is refused as an
 // identity change rather than pinned as if the check had passed.
 func TestConfirmingADeviceThatChangedAfterTheNumberWasIssuedPinsNothing(t *testing.T) {
 	r := newVerificationRig(t)
-	ch, err := r.client.ChallengeTrust(r.ctx, "home-pc")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ch := refusalChallenge(t, r)
 	onDevice, err := transport.VerifyCode(ch.Fingerprint, ch.Number)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if onDevice != ch.Code {
-		t.Fatalf("challenge code %s, the device would print %s", ch.Code, onDevice)
-	}
 	r.reinstallDevice(t)
+	// Even a correct code for the new certificate cannot replace the original.
+	onDevice, err = transport.VerifyCode(r.waitForDevice(t, ""), ch.Number)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	_, _, err = r.client.ConfirmTrust(r.ctx, ch, ch.Code, false)
+	_, _, err = r.client.ConfirmTrust(r.ctx, ch, onDevice, false)
 	var changed *VerifiedIdentityChangedError
 	if !errors.As(err, &changed) {
 		t.Fatalf("reinstalled device: want VerifiedIdentityChangedError, got %v", err)
@@ -246,42 +247,39 @@ func TestConfirmingADeviceThatChangedAfterTheNumberWasIssuedPinsNothing(t *testi
 	}
 }
 
-// A number carried in from an earlier refusal has no identity bound to it, so
-// the code is derived from whatever answers now. That is what makes the
-// two-process flow — an AI reading the number out of a refusal, a human reading
-// the code off the device — check the same thing the one-process flow does.
-func TestACarriedNumberIsCheckedAgainstTheCertificateAnsweringNow(t *testing.T) {
+// A carried number without its original certificate must never reach a dial.
+func TestACarriedNumberWithoutAFingerprintPinsNothing(t *testing.T) {
 	r := newVerificationRig(t)
-	_, _, err := r.client.Pair(r.ctx, "home-pc")
-	var first *TrustRequiredError
-	if !errors.As(err, &first) {
-		t.Fatalf("first contact: want TrustRequiredError, got %v", err)
-	}
-	// Same number, different device: the reinstall is what a swapped-in
-	// endpoint looks like from here.
-	r.reinstallDevice(t)
-
-	carried := &TrustChallenge{Target: first.Target, Number: first.Number}
-	if _, _, err := r.client.ConfirmTrust(r.ctx, carried, first.Code, false); err == nil {
-		t.Fatal("a code derived from the old certificate was accepted for the new one")
-	} else {
-		var mismatch *VerifyCodeMismatchError
-		if !errors.As(err, &mismatch) {
-			t.Fatalf("want VerifyCodeMismatchError, got %v", err)
-		}
-	}
-	// What the new device prints for the same number is accepted, and what it
-	// prints is what this controller derives from the certificate it presents.
-	replacement := r.waitForDevice(t, "")
-	now, err := transport.VerifyCode(replacement, first.Number)
+	ch := refusalChallenge(t, r)
+	onDevice, err := transport.VerifyCode(ch.Fingerprint, ch.Number)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if now == first.Code {
-		t.Fatal("the reinstalled device derived the old certificate's code")
+	ch.Fingerprint = ""
+	if _, _, err := r.client.ConfirmTrust(r.ctx, ch, onDevice, false); err == nil || !strings.Contains(err.Error(), "fingerprint") {
+		t.Fatalf("number without fingerprint: %v", err)
 	}
-	if _, _, err := r.client.ConfirmTrust(r.ctx, carried, now, false); err != nil {
-		t.Fatalf("confirm against the device that answered: %v", err)
+	if _, pinned := r.client.Pinned(ch.Target); pinned {
+		t.Fatal("missing fingerprint pinned a device")
+	}
+}
+
+func refusalChallenge(t *testing.T, r *verificationRig) *TrustChallenge {
+	t.Helper()
+	_, _, err := r.client.Pair(r.ctx, "home-pc")
+	var first *TrustRequiredError
+	if !errors.As(err, &first) {
+		t.Fatalf("first contact: %v", err)
+	}
+	return &TrustChallenge{Target: first.Target, Fingerprint: first.Fingerprint, Number: first.Number}
+}
+
+func assertNoDerivedCode(t *testing.T, text, code string) {
+	t.Helper()
+	for _, forbidden := range []string{code, transport.GroupDigits(code), "this controller derived:"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("controller disclosed derived code %q: %s", forbidden, text)
+		}
 	}
 }
 
@@ -289,10 +287,7 @@ func TestACarriedNumberIsCheckedAgainstTheCertificateAnsweringNow(t *testing.T) 
 // screen must be the same number as the ungrouped one in the command.
 func TestThePrintedNumberIsTheGroupedFormOfTheCommandNumber(t *testing.T) {
 	r := newVerificationRig(t)
-	ch, err := r.client.ChallengeTrust(r.ctx, "home-pc")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ch := refusalChallenge(t, r)
 	grouped := transport.GroupDigits(ch.Number)
 	if strings.ReplaceAll(grouped, " ", "") != ch.Number {
 		t.Fatalf("printed number %q is not %q grouped", grouped, ch.Number)
@@ -302,5 +297,17 @@ func TestThePrintedNumberIsTheGroupedFormOfTheCommandNumber(t *testing.T) {
 	}
 	if !regexp.MustCompile(`^\d{6}$`).MatchString(ch.Number) {
 		t.Fatalf("number %q is not six digits", ch.Number)
+	}
+}
+
+// No initialized transport is needed to reject an unbound challenge. Moving
+// validation past the dial would make this dereference the absent identity.
+func TestConfirmTrustRejectsMissingFingerprintBeforeDial(t *testing.T) {
+	c := &Client{}
+	for _, fp := range []string{"", "not-a-fingerprint"} {
+		_, _, err := c.ConfirmTrust(context.Background(), &TrustChallenge{Target: "alice/device", Fingerprint: fp, Number: "482913"}, "771204638", false)
+		if err == nil || !strings.Contains(err.Error(), "fingerprint") {
+			t.Fatalf("fingerprint %q: %v", fp, err)
+		}
 	}
 }

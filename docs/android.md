@@ -81,15 +81,17 @@ The app's 电池 button links to the equivalent path for OPPO, Xiaomi and Huawei
 The gates fire one at a time and each has a different fix, so the first three
 `wanctl exec` attempts fail differently:
 
-1. **The controller must confirm the device's identity.** `wanctl exec` prints a
-   verification number and the code this controller derived from the certificate
-   the device presented. Open 连接详情 → 连接校验 on the phone, type that number
-   in, and compare the nine digits it shows with the nine on the terminal — the
-   controller refuses any code it cannot derive from the certificate answering
-   now. The same refusal also carries the
-   `wanctl trust server --target … --fingerprint …` line, for a device whose
-   wanctl predates `wanctl verify`: that comparison is the whole point, so do it
-   with your eyes rather than pasting.
+1. **The controller must confirm the device's identity.** `wanctl exec` prints
+   a target, fingerprint and verification number, but never the expected code.
+   Open 连接详情 → 连接校验 on the phone and enter that number. Read the nine
+   digits the phone shows, then run
+   `wanctl trust server --target … --fingerprint … --number … --code …`, keeping
+   the target, fingerprint and number from the same refusal and using the code
+   printed on the phone. The controller requires that original identity to
+   answer again and checks the reported code; a wrong code or changed identity
+   pins nothing. There is no interactive prompt. For a device whose wanctl
+   predates `wanctl verify`, independently compare the full fingerprint on the
+   device, then use `wanctl trust server --target … --fingerprint …`.
 2. **The device must trust the controller.** Unless 自动信任新控制端 is on, the
    agent refuses and prints a portal URL, valid five minutes, for the device
    owner to click.

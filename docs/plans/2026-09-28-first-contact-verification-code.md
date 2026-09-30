@@ -3,6 +3,11 @@
 Issue: [#129](https://github.com/Daily-AC/wanctl/issues/129). Decision record:
 [ADR 0015](../adr/0015-first-contact-verification-code.md).
 
+> Historical implementation plan. The security review superseded its interactive
+> flow and controller-displayed code: confirmation now requires the original
+> fingerprint together with the number and the code read on the device. The
+> controller never prints the expected answer. See ADR 0015 for the current design.
+
 ## Why
 
 First contact asked a human to compare a 43-character fingerprint between a

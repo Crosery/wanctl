@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"wanctl/internal/client"
+	"wanctl/internal/transport"
 
 	mcpapi "github.com/mark3labs/mcp-go/mcp"
 )
@@ -17,12 +18,11 @@ import (
 // answer exists for — so the number, the code and the device-side command all
 // have to be in the text, and the code has to be described as what the device
 // prints rather than something to echo back.
-func TestTrustRequiredOverHTTPCarriesTheDeviceCodeAndNoCLICommand(t *testing.T) {
+func TestTrustRequiredOverHTTPCarriesTheChallengeButNotTheDeviceCode(t *testing.T) {
 	err := &client.TrustRequiredError{
 		Target:      trustTarget,
 		Fingerprint: pinnedFP,
 		Number:      "482913",
-		Code:        "771204638",
 	}
 	res := dialErrorResult(&remoteSession{}, err)
 	if !res.IsError {
@@ -32,8 +32,9 @@ func TestTrustRequiredOverHTTPCarriesTheDeviceCodeAndNoCLICommand(t *testing.T) 
 	for _, want := range []string{
 		"DEVICE IDENTITY CONFIRMATION REQUIRED",
 		"verification number: 482 913",
-		"verification code:   771 204 638",
 		"wanctl verify 482913",
+		"fingerprint",
+		"same refusal",
 		`number="482913"`,
 		"the nine digits",
 		"the digits the USER read off",
@@ -48,6 +49,7 @@ func TestTrustRequiredOverHTTPCarriesTheDeviceCodeAndNoCLICommand(t *testing.T) 
 			t.Errorf("missing %q in:\n%s", want, text)
 		}
 	}
+	assertNoControllerCode(t, text, deviceCodeForRefusal(t))
 	if strings.Contains(text, "wanctl trust server --target") {
 		t.Errorf("HTTP mode points the model at a CLI it cannot run:\n%s", text)
 	}
@@ -61,17 +63,19 @@ func TestTrustRequiredOverStdioCarriesBothEnds(t *testing.T) {
 		Target:      trustTarget,
 		Fingerprint: pinnedFP,
 		Number:      "482913",
-		Code:        "771204638",
 	}
 	text := toolText(dialErrorResult(&localFsSession{}, err))
 	for _, want := range []string{
 		"wanctl verify 482913",
-		"--number 482913 --code 771204638",
+		"fingerprint",
+		"same refusal",
+		"--number 482913 --code <the code the device shows>",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing %q in:\n%s", want, text)
 		}
 	}
+	assertNoControllerCode(t, text, deviceCodeForRefusal(t))
 	if strings.Contains(text, "wanctl_trust_server") {
 		t.Errorf("stdio mode points a human at the MCP tool:\n%s", text)
 	}
@@ -95,6 +99,8 @@ func TestMCPTrustServerRefusesAPinNobodyVerified(t *testing.T) {
 		{"no target", map[string]any{"code": "771204638"}, "target is required"},
 		{"nothing verified", map[string]any{"target": "alice/build"}, "nothing to verify with"},
 		{"code without a number", map[string]any{"target": "alice/build", "code": "771204638"}, "nothing to verify with"},
+		{"number without fingerprint", map[string]any{"target": "alice/build", "number": "482913", "code": "771204638"}, "fingerprint is required with number"},
+		{"code without number with fingerprint", map[string]any{"target": "alice/build", "fingerprint": pinnedFP, "code": "771204638"}, "number is required with code"},
 		{"number without the code", map[string]any{"target": "alice/build", "number": "482913"}, "code is required with number"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -108,5 +114,22 @@ func TestMCPTrustServerRefusesAPinNobodyVerified(t *testing.T) {
 				t.Fatalf("result = %+v, want an error mentioning %q", result, tc.want)
 			}
 		})
+	}
+}
+
+func deviceCodeForRefusal(t *testing.T) string {
+	t.Helper()
+	code, err := transport.VerifyCode(pinnedFP, "482913")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code
+}
+func assertNoControllerCode(t *testing.T, text, code string) {
+	t.Helper()
+	for _, forbidden := range []string{code, transport.GroupDigits(code), "this controller derived:", "verification code:"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("controller disclosed expected code %q: %s", forbidden, text)
+		}
 	}
 }

@@ -30,48 +30,63 @@ Three things follow from that:
 
 ## Decision
 
-Derive a **nine-digit verification code** from the certificate that dial
-presented, have the device print its own derivation of the same code locally, and
-let the human compare those instead — with the code checked on this side, not
-merely displayed.
+Use an explicit two-step flow. The controller records the certificate it saw
+before disclosing a fresh verification number; the human reads the resulting
+nine-digit code from the device and reports it with that original fingerprint.
+The controller never displays the expected answer.
 
-- The controller draws a **verification number** (six digits, fresh per dial)
-  and derives `code = SHA256("wanctl/verify/v1" ‖ fingerprint ‖ number)`, first
-  nine decimal digits. Both are printed beside the fingerprint, with the exact
-  command that uses them.
-- On the device, `wanctl verify <number>` prints the same derivation computed
-  from that installation's **own certificate**, and names the number it answered.
-  It is local by construction: no relay, no agent, no network, just the identity
-  files — which is what makes it usable on exactly the device whose identity is
-  not yet trusted. The Android app runs the same command from 连接详情 → 连接校验,
-  so a phone shows the code on its own screen.
-- On the controller, `wanctl trust server --target X --number N --code C`
-  re-dials, derives the code from the certificate answering now, and pins only on
-  a match. A mismatch is `VERIFICATION CODE MISMATCH` and pins nothing. With no
-  flags on a terminal, the same check runs as one exchange: print the number, ask
-  for the code the device shows, pin on a match — the code this side would accept
-  is deliberately not printed there, so what is typed has to come off the device.
-- `--fingerprint` keeps working, for a device whose wanctl predates `wanctl
-  verify` and for anyone who would rather compare the whole string.
-- The MCP tool takes `number` and `code` and treats `fingerprint` as optional, so
-  a model can resolve first contact from the user's spoken answer alone. A call
-  carrying neither proof is refused.
+- The first-contact refusal carries the canonical target, certificate
+  fingerprint and a fresh six-digit **verification number**. It includes the
+  device-side command and a trust command with a placeholder for the device's
+  answer, never a prefilled verification code.
+- On the device, `wanctl verify <number>` derives a nine-digit code from the
+  verification number and that installation's **own certificate**, using the
+  domain-separated `wanctl/verify/v1` SHA256 derivation. It names the number it
+  answered. This is local: no relay, no agent, no network, just existing identity
+  files. The Android app runs it from 连接详情 → 连接校验. A device without an
+  identity refuses rather than creating one.
+- On the controller, run:
 
-**Why the number, and not a truncated fingerprint.** Truncating the fingerprint
-(or encoding it as words) is forgeable: the relay already knows the real device's
-fingerprint from its own device records, so an attacker grinds a key pair whose
-truncated digest matches and the human's short comparison succeeds. Binding a
-number that is drawn per dial and never touches the wire makes precomputation
-useless: to win, a substituted certificate must satisfy
-`code(attacker_fp, N) == code(real_fp, N)` for a number that did not exist when
-the certificate was chosen — a 1e-9 collision, per dial, with a visible mismatch
-every other time.
+  ```sh
+  wanctl trust server --target X --fingerprint SHA256:... \
+    --number N --code C
+  ```
 
-**What does not change.** The pin, its `--replace`-is-a-human-decision rule, the
-pairing/approval gate, the trust store, and the rule that first contact sends
-nothing: no hello, no probe, nothing is sent to an endpoint this controller has
-not pinned. The number reaches the device through the human; both derivations are
-local; no relay, portal or resolver can forge a match.
+  Target, fingerprint and number must come from the **same first-contact
+  refusal**; code comes only from the device's output. The controller re-dials,
+  refuses unless the current fingerprint is exactly the original one, checks
+  the code, and pins on a match. A wrong code returns `VERIFICATION CODE
+  MISMATCH` without revealing the expected answer or writing a pin. A changed
+  certificate returns `DEVICE IDENTITY MISMATCH`.
+- There is no interactive trust path. A number requires both code and
+  fingerprint. A code without a number is rejected, even if a fingerprint is
+  also supplied. A missing proof cannot silently become fingerprint-only trust.
+- Fingerprint-only pinning remains supported after an independent comparison
+  of the whole fingerprint, including for devices older than `wanctl verify`.
+- The MCP tool uses the same bound flow. Fingerprint is required in its schema;
+  number and code are an optional pair. Its existing unsafe opt-in gate and
+  host authorization requirements remain unchanged.
+
+**Why the original fingerprint matters.** The short code is useful only while
+bound to the certificate observed before the verification number was disclosed.
+The second invocation must carry that fingerprint explicitly. Allowing a new
+certificate to be chosen after disclosure would permit an attacker to search
+for one whose code matches the real device's answer. A code check against only
+whatever certificate answers the later dial is therefore insufficient.
+
+**Why the number, and not a truncated fingerprint.** The relay already knows
+the real device's fingerprint from its device records. A fixed short
+fingerprint can be attacked before the human starts checking. Drawing the
+number after observing a certificate and requiring that certificate again
+prevents substituting an adaptively chosen certificate at confirmation. The
+nine-digit code remains a comparison aid based on public inputs, not a secret
+or a proof of possession. The human must obtain it independently on the device;
+controller-side output must never make copying the expected answer a shortcut.
+
+**What does not change.** The stored pin, the requirement for an explicit human
+`--replace` decision after investigation, pairing, and policy checks remain.
+First contact sends no application data to an unpinned endpoint. The number
+reaches the device through the human and both derivations are local.
 
 ## Rejected alternatives
 
@@ -110,15 +125,15 @@ local; no relay, portal or resolver can forge a match.
 - `internal/transport/verifycode_test.go`: the derivation is a pure function of
   (fingerprint, number), moves with both inputs, refuses anything that is not a
   fingerprint or a six-digit number, and spreads across the digit space.
-- `internal/client/verification_e2e_test.go`: over a real relay and a real agent,
-  first contact hands over a number and the device's code; a code that did not
-  come off the device pins nothing; the device's own code pins it and the device
-  is then drivable; a device reinstalled after the number was issued is refused
-  as an identity change; a number carried in from an earlier refusal is checked
-  against the certificate answering now.
+- `internal/client/verification_e2e_test.go`: a real relay and agent exercise
+  refusal, device-side verification, successful bound pinning, wrong-code
+  rejection, missing-fingerprint rejection, and refusal after identity changes.
+  First-contact and mismatch errors do not disclose the expected answer.
 - `verify_cli_test.go`: the same journey through the real binary in separate
-  processes, including `wanctl verify` run against the agent's own config dir
-  printing the code the controller derived.
-- `internal/mcp/trustcode_test.go`: the HTTP refusal carries the number, the
-  code, and the device-side command without naming a CLI the model cannot run;
-  the handler refuses a pin that nothing was verified for.
+  processes. The code comes exclusively from `wanctl verify` against the
+  agent's own config directory; the controller carries the original fingerprint.
+  Incomplete flags fail without a prompt or pin, and fingerprint-only trust
+  remains supported.
+- `internal/mcp/trustcode_test.go` and `trustcode_e2e_test.go`: the MCP refusal
+  exposes the number, fingerprint and device-side command without the expected
+  code, and the handler requires the complete bound verification inputs.

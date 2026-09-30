@@ -100,10 +100,7 @@ func TestVerifyNumberIsFreshAndSixDigits(t *testing.T) {
 	seen := map[string]bool{}
 	firstDigits := map[byte]int{}
 	for range 2000 {
-		n, err := NewVerifyNumber()
-		if err != nil {
-			t.Fatal(err)
-		}
+		n := NewVerifyNumber()
 		if !regexp.MustCompile(`^[0-9]{6}$`).MatchString(n) {
 			t.Fatalf("number %q is not six digits", n)
 		}

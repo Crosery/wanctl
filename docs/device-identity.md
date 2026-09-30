@@ -26,33 +26,43 @@ The portal uses full IDs for actions and shows a short ID beside duplicate label
 ## First contact
 
 A controller that has never dialled an installation stops with `DEVICE IDENTITY
-CONFIRMATION REQUIRED`, and nothing is sent to it until a human has confirmed
-which installation answered. Two values are offered for that confirmation:
+CONFIRMATION REQUIRED`, and sends no application data until a human confirms
+which installation answered. The refusal carries the target, certificate
+fingerprint (`SHA256:<base64>`), and a fresh six-digit **verification number**.
+It never prints the expected verification code.
 
-- the certificate fingerprint, `SHA256:<base64>` — precise, and forty-three
-  characters compared between a phone screen and a terminal;
-- a **verification number** (six digits, drawn fresh for this dial) and the
-  **verification code** derived from it and the certificate the dial presented.
-  `wanctl verify <number>` run on the device prints the same derivation computed
-  from that installation's own certificate, locally — no relay, no agent, no
-  network — and the Android app runs the same command from 连接详情 → 连接校验.
-  The controller accepts a code only if it reproduces it from the certificate
-  answering at that moment, so a code that did not come off that device pins
-  nothing, and a device that changed in between fails as a mismatch.
-
-The controller then records the result in its own `known_servers.json`:
+1. Keep the target, fingerprint and number from that same refusal. On the device,
+   run `wanctl verify <number>`, or use the Android app's 连接详情 → 连接校验.
+   The device prints a nine-digit **verification code** from its own certificate
+   and that number, locally: no relay, no agent, no network.
+2. Report the device's code to the controller with the original target,
+   fingerprint and number. All four values are required for the code form:
 
 ```sh
-wanctl trust server --target ns/device --number 482913 --code 771204638   # checked
-wanctl trust server --target ns/device --fingerprint SHA256:...           # compared by eye
+wanctl trust server --target ns/device --fingerprint SHA256:... \
+  --number 482913 --code 771204638
 ```
 
-The number is drawn per dial and reaches the device through the human, never over
-the relay, which is what lets nine digits carry the weight of the fingerprint
-they replace: a substituted certificate would have to collide with the real
-device's code for a number that did not exist when that certificate was chosen.
-The fingerprint comparison remains supported for a device whose wanctl predates
-`wanctl verify`.
+The fingerprint must be the one observed before the number was disclosed. The
+controller re-dials and requires that exact fingerprint, then checks the
+reported code. A changed identity or a wrong code pins nothing. Neither the
+initial refusal nor a code-mismatch error reveals the expected code. Do not
+calculate an answer on the controller or reuse one from an earlier check: read
+it on the intended device. There is no interactive trust prompt.
+
+The number reaches the device through the human, never over the relay. Binding
+the confirmation to the original fingerprint prevents an attacker from choosing
+a different certificate after learning the number. The code is a comparison aid
+based on public inputs, not a secret or a proof of possession.
+
+For a device whose wanctl predates `wanctl verify`, independently compare the
+full fingerprint shown on that device with the refusal, then use:
+
+```sh
+wanctl trust server --target ns/device --fingerprint SHA256:...
+```
+
+On success, the controller records the pin in its own `known_servers.json`.
 
 ## Upgrade
 

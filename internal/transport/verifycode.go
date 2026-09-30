@@ -64,27 +64,18 @@ func cutoff(space uint32) uint32 {
 
 // NewVerifyNumber returns a fresh per-dial verification number: uniformly
 // random decimal digits from the system CSPRNG.
-func NewVerifyNumber() (string, error) {
-	v, err := uniformBelow(verifyNumberSpace)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%0*d", VerifyNumberDigits, v), nil
+func NewVerifyNumber() string {
+	return fmt.Sprintf("%0*d", VerifyNumberDigits, uniformBelow(verifyNumberSpace))
 }
 
-// uniformBelow returns a uniformly random value in [0, n).
-func uniformBelow(n uint32) (uint32, error) {
-	if n == 0 {
-		return 0, fmt.Errorf("verification code: empty range")
-	}
+// uniformBelow returns a uniformly random value in [0, n), for n > 0.
+func uniformBelow(n uint32) uint32 {
 	limit := cutoff(n)
 	var buf [4]byte
 	for {
-		if _, err := rand.Read(buf[:]); err != nil {
-			return 0, fmt.Errorf("verification code: %w", err)
-		}
+		rand.Read(buf[:]) // Go 1.26 terminates the process if the CSPRNG fails.
 		if v := binary.BigEndian.Uint32(buf[:]); v < limit {
-			return v % n, nil
+			return v % n
 		}
 	}
 }

@@ -78,6 +78,12 @@ func TestMCPFirstContactEndsInAPinAndTheCommandRuns(t *testing.T) {
 	// 2. What the DEVICE answers for that number, computed here from the
 	// device's own certificate — the value `wanctl verify` prints on it.
 	onDevice := deviceCode(t, deviceDir, number)
+	fpMatch := regexp.MustCompile(`fingerprint:\s+(\S+)`).FindStringSubmatch(text)
+	if fpMatch == nil {
+		t.Fatalf("refusal has no fingerprint: %s", text)
+	}
+	fingerprint := fpMatch[1]
+	assertNoControllerCode(t, text, onDevice)
 
 	// 3. A code nobody read off the device pins nothing.
 	wrong := "000000000"
@@ -85,7 +91,7 @@ func TestMCPFirstContactEndsInAPinAndTheCommandRuns(t *testing.T) {
 		wrong = "111111111"
 	}
 	denied, err := mcpTrustServer(ctx, mcpapi.CallToolRequest{Params: mcpapi.CallToolParams{Arguments: map[string]any{
-		"target": "home-pc", "number": number, "code": wrong,
+		"target": "home-pc", "fingerprint": fingerprint, "number": number, "code": wrong,
 	}}})
 	if err != nil {
 		t.Fatal(err)
@@ -93,13 +99,14 @@ func TestMCPFirstContactEndsInAPinAndTheCommandRuns(t *testing.T) {
 	if !denied.IsError || !strings.Contains(toolText(denied), "VERIFICATION CODE MISMATCH") {
 		t.Fatalf("fabricated code accepted: %+v", denied)
 	}
+	assertNoControllerCode(t, toolText(denied), onDevice)
 	if store := openTrustStore(t); len(store.List()) != 0 {
 		t.Fatalf("a refused verification pinned something: %+v", store.List())
 	}
 
 	// 4. The code the device prints pins it.
 	pinned, err := mcpTrustServer(ctx, mcpapi.CallToolRequest{Params: mcpapi.CallToolParams{Arguments: map[string]any{
-		"target": "home-pc", "number": number, "code": onDevice,
+		"target": "home-pc", "fingerprint": fingerprint, "number": number, "code": onDevice,
 	}}})
 	if err != nil {
 		t.Fatal(err)
