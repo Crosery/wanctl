@@ -4,7 +4,7 @@ go 1.26.10
 
 require (
 	github.com/coder/websocket v1.8.15
-	golang.org/x/sys v0.48.0
+	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -16,8 +16,8 @@ require (
 	github.com/mark3labs/mcp-go v0.55.1
 	github.com/quic-go/quic-go v0.63.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
-	golang.org/x/crypto v0.57.0
-	golang.org/x/term v0.46.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/term v0.47.0
 	mvdan.cc/sh/v3 v3.13.1
 )
 
@@ -32,6 +32,6 @@ require (
 	github.com/spf13/cast v1.7.1 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 )
