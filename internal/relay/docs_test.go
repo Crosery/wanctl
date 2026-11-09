@@ -152,10 +152,10 @@ func (a *roleAdmin) RoleForNamespace(ns string) (string, error) {
 type noopAdmin struct{}
 
 func (n *noopAdmin) ResolveUser(string) (string, error) { return "", nil }
-func (n *noopAdmin) ResolveIdentity(string, string, string, string, string, string) (string, string, error) {
+func (n *noopAdmin) ResolveIdentity(string, string, string, string, string) (string, string, error) {
 	return "", "", nil
 }
-func (n *noopAdmin) CreateInvite(string) (Invite, string, error)    { return Invite{}, "", nil }
+func (n *noopAdmin) CreateInvite(string) (Invite, error)            { return Invite{}, nil }
 func (n *noopAdmin) ListInvites() ([]Invite, error)                 { return nil, nil }
 func (n *noopAdmin) RevokeInvite(int) (bool, error)                 { return false, nil }
 func (n *noopAdmin) UpsertDevice(string, string, string)            {}
@@ -174,6 +174,21 @@ func (n *noopAdmin) ListAdminNamespaces() ([]string, error) { return nil, nil }
 func (n *noopAdmin) LookupUser(string) (bool, error)        { return false, nil }
 func (n *noopAdmin) CreateAccessRequest(string, string, string, string) (AccessRequest, error) {
 	return AccessRequest{}, nil
+}
+func (n *noopAdmin) ContactEmail(string, string) (ContactEmail, error) { return ContactEmail{}, nil }
+func (n *noopAdmin) IssueEmailConfirmation(string, string, string, string, string) (EmailConfirmation, string, error) {
+	return EmailConfirmation{}, "", nil
+}
+func (n *noopAdmin) MarkEmailConfirmationSent(int) error { return nil }
+func (n *noopAdmin) FailEmailConfirmation(int) error     { return nil }
+func (n *noopAdmin) CancelEmailConfirmations(string, string) error {
+	return nil
+}
+func (n *noopAdmin) PeekEmailConfirmation(string) (EmailConfirmation, error) {
+	return EmailConfirmation{}, ErrTokenUnknown
+}
+func (n *noopAdmin) ConfirmEmail(string) (EmailConfirmation, error) {
+	return EmailConfirmation{}, ErrTokenUnknown
 }
 func (n *noopAdmin) LatestAccessRequest(string, string) (AccessRequest, bool, error) {
 	return AccessRequest{}, false, nil
@@ -208,6 +223,7 @@ func (n *noopAdmin) RoleForNamespace(string) (string, error)    { return "", sql
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	bearerFromQuery(req)
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}

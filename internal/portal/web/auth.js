@@ -1,4 +1,4 @@
-/* wanctl 的三张认证页共用的脚本：登录 / 等待邀请 / 设备授权。
+/* wanctl 的认证页共用的脚本：登录 / 绑定邮箱 / 确认邮箱 / 申请访问 / 设备授权。
    不能直接用 app.js —— 它在模块作用域里就去找 #grid / #who 这些只有 SPA
    才有的元素，拿到 null 之后下一句属性访问就抛，整个脚本死掉。
    所以这是独立的一小份，只做这三张页面真的需要的事。 */
@@ -30,7 +30,7 @@
     $$('[data-ph-en]').forEach(function (el) {
       el.setAttribute('placeholder', el.getAttribute('data-ph-' + l));
     });
-    // 等待邀请页上「还有几天可以再申请」。数字由服务端算，句子在这里拼 ——
+    // 申请页上「还有几天可以再申请」。数字由服务端算，句子在这里拼 ——
     // 「in 1 days」是错的英文，而单复数不是 data-en/data-zh 装得下的东西。
     var retry = $('#retry');
     if (retry) {
@@ -223,42 +223,23 @@
     };
   }
 
-  /* ── 等待邀请页：兑换邀请码 / 退出登录 ─────────────────────────── */
-  var form = $('#redeem');
-  if (form) {
-    var err = $('#err');
-    var btn = form.querySelector('button');
-    var say = function (en, zh) { err.textContent = lang === 'en' ? en : zh; };
-
-    form.onsubmit = function (e) {
-      e.preventDefault();
-      var v = $('#code').value.trim();
-      err.textContent = '';
-      if (!v) { say('Paste an invite code first.', '请先粘贴邀请码。'); return; }
-      btn.disabled = true;
-      post('/auth/redeem', { code: v }).then(function (r) {
-        if (r.ok) { location.href = form.dataset.next || '/'; return; }
-        return r.text().then(function (t) {
-          btn.disabled = false;
-          // 403 就是「这个码不行」，说人话；其余状态原样透出服务端的说明 ——
-          // 它们少见，而少见的时候原因比语言一致更值钱。
-          if (r.status === 403) say('That code was not accepted.', '这个邀请码没被接受。');
-          else err.textContent = t.trim() || ('HTTP ' + r.status);
-        });
-      }).catch(function () {
-        btn.disabled = false;
-        say('Network error — try again.', '网络错误，请重试。');
-      });
-    };
-
+  /* ── 申请页：头像拉不到就露出首字母 ─────────────────────────────
+     GitHub 的图床在有些网络里进不来。图片挂掉时把它拿走，底下那层首字母
+     就是这一格的样子。事件可能在脚本跑起来之前就发生了，所以先查一次。 */
+  var face = $('.me img');
+  if (face) {
+    var drop = function () { face.remove(); };
+    if (face.complete && !face.naturalWidth) drop();
+    else face.addEventListener('error', drop);
   }
 
+  /* ── 申请页：退出登录 ─────────────────────────────────────────── */
   var signOut = $('#out');
   if (signOut) signOut.onclick = function () {
     post('/auth/logout').then(function () { location.href = '/'; });
   };
 
-  /* ── 等待邀请页：申请访问 ───────────────────────────────────────────
+  /* ── 申请页：提交申请 ─────────────────────────────────────────────
      交完之后不在这里自己画「已提交」——重新加载，让服务端说它现在是什么
      状态。四种状态本来就是服务端算的，客户端再算一遍就是第二份真源。 */
   var ask = $('#ask');
@@ -277,6 +258,8 @@
           // 中继用固定的错误 token 说话（形状同好友那套），认识的翻译成
           // 人话，不认识的原样透出——少见的时候原因比语言一致更值钱。
           if (token === 'request-open' || token === 'request-approved') { location.reload(); return; }
+          // 邮箱在门页已经绑过；走到这里说明它在别处被改了，回门页重走一遍。
+          if (token === 'email-required') { location.href = '/auth/email?next=%2Fpending'; return; }
           if (token === 'request-cooldown') {
             askErr.textContent = lang === 'en'
               ? 'You asked recently. Try again later.' : '你刚申请过，过些天再来。';
@@ -287,6 +270,113 @@
       }).catch(function () {
         askBtn.disabled = false;
         askErr.textContent = lang === 'en' ? 'Network error — try again.' : '网络错误，请重试。';
+      });
+    };
+  }
+
+  /* ── 绑定邮箱（门页）────────────────────────────────────────────────
+     错误全是 {"error": token} 的形状。认识的翻译成人话；限流的那两种
+     带着还要等几秒，换算成分钟说出来。 */
+  function emailErr(token, retry) {
+    var mins = Math.max(1, Math.ceil((retry || 0) / 60));
+    var hrs = Math.max(1, Math.ceil((retry || 0) / 3600));
+    var say = {
+      'email-invalid': ['That address does not look right.', '邮箱格式不对。'],
+      'email-unchanged': ['That is already your address.', '这已经是你现在的邮箱了。'],
+      'rate-address': ['A link just went to this address. Try again in ' + mins + (mins === 1 ? ' minute.' : ' minutes.'),
+                       '刚给这个地址发过一封，' + mins + ' 分钟后再试。'],
+      'rate-identity': ['That is the most links for one day. Try again in ' + hrs + (hrs === 1 ? ' hour.' : ' hours.'),
+                        '今天发得太多了，' + hrs + ' 小时后再试。'],
+      'mail-failed': ["We couldn't send it. Check the address, or try again later.", '信没发出去。检查一下地址，或者稍后再试。']
+    }[token];
+    if (say) return lang === 'en' ? say[0] : say[1];
+    return token || (lang === 'en' ? 'Network error — try again.' : '网络错误，请重试。');
+  }
+  function readErr(r) {
+    return r.json().catch(function () { return {}; }).then(function (b) { return emailErr(b.error, b.retry_after); });
+  }
+
+  var emailForm = $('#emailForm');
+  if (emailForm) {
+    var body = document.body, next = body.getAttribute('data-next') || '/';
+    var emailIn = $('#emailIn'), emailErrEl = $('#emailErr'), sentErr = $('#sentErr');
+    var sendBtn = emailForm.querySelector('button');
+    var send = function (address, errEl, btn) {
+      errEl.textContent = '';
+      btn.disabled = true;
+      return post('/auth/email/send', { address: address, next: next }).then(function (r) {
+        btn.disabled = false;
+        if (r.ok) {
+          return r.json().then(function (b) {
+            $('#sentTo').textContent = b.address || address;
+            body.setAttribute('data-req', 'sent');
+            sentErr.textContent = '';
+            watch();
+          });
+        }
+        return readErr(r).then(function (msg) { errEl.textContent = msg; });
+      }).catch(function () {
+        btn.disabled = false;
+        errEl.textContent = lang === 'en' ? 'Network error — try again.' : '网络错误，请重试。';
+      });
+    };
+    emailForm.onsubmit = function (e) {
+      e.preventDefault();
+      send(emailIn.value.trim(), emailErrEl, sendBtn);
+    };
+    $('#resend').onclick = function () {
+      send($('#sentTo').textContent.trim(), sentErr, $('#resend'));
+    };
+    $('#change').onclick = function () {
+      body.setAttribute('data-req', 'form');
+      emailErrEl.textContent = '';
+      emailIn.focus();
+      emailIn.select();
+    };
+    /* 信发出以后，隔几秒问一次确认了没有；标签页藏起来就不问，回来时马上问一次。
+       确认了就去原来要去的地方。 */
+    var timer = null;
+    var check = function () {
+      if (document.hidden || body.getAttribute('data-req') !== 'sent') return;
+      fetch('/auth/email/status').then(function (r) { return r.ok ? r.json() : {}; }).then(function (b) {
+        if (b.confirmed) location.href = next;
+      }).catch(function () {});
+    };
+    var watch = function () {
+      if (!timer) timer = setInterval(check, 4000);
+    };
+    document.addEventListener('visibilitychange', check);
+    if (body.getAttribute('data-req') === 'sent') watch();
+  }
+
+  /* ── 确认邮箱（信里那个链接）─────────────────────────────────────────
+     打开页面什么都不做，按按钮才 POST。确认成功后：如果这个浏览器就是
+     发信的那个账号，直接去原来要去的地方；否则（多半是手机）告诉人可以关了。 */
+  var confirmForm = $('#confirmForm');
+  if (confirmForm) {
+    var confirmBtn = confirmForm.querySelector('button'), confirmErr = $('#confirmErr');
+    confirmForm.onsubmit = function (e) {
+      e.preventDefault();
+      confirmBtn.disabled = true;
+      confirmErr.textContent = '';
+      post('/auth/email/confirm', { token: confirmForm.getAttribute('data-token') }).then(function (r) {
+        if (r.ok) {
+          return r.json().then(function (b) {
+            if (b.next) { location.href = b.next; return; }
+            document.body.setAttribute('data-req', 'done');
+          });
+        }
+        return r.json().catch(function () { return {}; }).then(function (b) {
+          if (b.error === 'token-used' || b.error === 'token-expired' || b.error === 'token-unknown') {
+            document.body.setAttribute('data-req', b.error.slice('token-'.length));
+            return;
+          }
+          confirmBtn.disabled = false;
+          confirmErr.textContent = b.error || (lang === 'en' ? 'Network error — try again.' : '网络错误，请重试。');
+        });
+      }).catch(function () {
+        confirmBtn.disabled = false;
+        confirmErr.textContent = lang === 'en' ? 'Network error — try again.' : '网络错误，请重试。';
       });
     };
   }

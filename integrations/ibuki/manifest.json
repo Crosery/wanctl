@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "id": "wanctl",
+  "ibukiPluginId": "devices",
+  "wanctl": ">=0.29.1",
+  "commands": [
+    {
+      "id": "status",
+      "title": "查看本机 wanctl 状态",
+      "readOnly": true,
+      "humanOnly": false,
+      "argv": ["status"],
+      "result": "本机 agent 的运行、relay、凭据和自动更新状态"
+    },
+    {
+      "id": "peers",
+      "title": "查看 wanctl 设备",
+      "readOnly": true,
+      "humanOnly": false,
+      "argv": ["peers"],
+      "result": "当前凭据可访问的设备和好友分享设备"
+    },
+    {
+      "id": "start",
+      "title": "启动本机 wanctl",
+      "readOnly": false,
+      "humanOnly": true,
+      "argv": ["start"],
+      "result": "让本机 agent 上线；没有凭据时需要本人完成报名"
+    },
+    {
+      "id": "login",
+      "title": "登录 wanctl",
+      "readOnly": false,
+      "humanOnly": true,
+      "argv": ["login"],
+      "result": "打开报名流程并保存本机专用凭据"
+    }
+  ]
+}

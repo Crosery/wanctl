@@ -66,6 +66,8 @@
       noTrusted: 'No controller is trusted yet.',
       noRules: 'No rules — every request asks you.',
       noLog: 'No activity yet.',
+      connected: 'Connected',
+      times: function (n) { return ' · ' + n + ' times'; },
       noTokens: 'No tokens yet.',
       noInvites: 'No invites yet.',
       noFriends: 'No friends yet.',
@@ -81,9 +83,10 @@
       rulePlaceholder: 'echo *   or   /data',
       issue: 'Issue', label: 'Label', labelPlaceholder: 'laptop, ci, …',
       expiry: 'Expires in days (0 = never)',
-      newInvite: 'New invite', inviteLogin: 'GitHub login (optional)',
-      invitePlaceholder: 'fill in to pre-register; leave empty for a one-time code',
-      inviteCode: 'code', invitePre: 'pre-registered', invitePending: 'unused', inviteUsed: 'used by',
+      newInvite: 'New invite', inviteLogin: 'GitHub login',
+      invitePlaceholder: 'they are admitted when they sign in with this account',
+      inviteNeedLogin: 'Enter the GitHub login to invite.',
+      inviteCode: 'code (retired)', invitePre: 'pre-registered', invitePending: 'unused', inviteUsed: 'used by',
       reqWants: 'is asking for access', approve: 'Approve',
       reqOK: 'Approved — that login is now invited.', reqNo: 'Declined.',
       addFriend: 'Add friend', friendNS: "Their username (namespace)", send: 'Send request',
@@ -106,8 +109,18 @@
       eNoFriend: 'That is not one of your friends.',
       eNotFriends: 'You are not friends yet.',
       ePending: 'That invite has not been accepted yet.',
+      eDisabled: 'This account has been disabled. Contact the operator.',
+      emailNone: 'No address confirmed yet.',
+      emailSent: function (a) { return 'Sent. Open the link in the mail to ' + a + '.'; },
+      emailDropped: 'Change cancelled. Your address stays as it was.',
+      'email-invalid': 'That address does not look right.',
+      'email-unchanged': 'That is already your address.',
+      'rate-address': 'A link just went to this address. Try again in a few minutes.',
+      'rate-identity': 'That is the most links for one day. Try again tomorrow.',
+      'mail-failed': "We couldn't send it. Check the address, or try again later.",
       eBadCode: 'That code is not valid.',
       ePairGone: 'That pairing request expired or was already answered. Ask the AI to try again.',
+      eRequestGone: 'That request was already answered elsewhere, or it expired. Nothing changed.',
       failedGeneric: 'That did not work.',
       failedCode: 'Failed:',
       aliasTaken: 'Another device already answers to that alias.',
@@ -119,6 +132,27 @@
       lastFail: function (w, e) { return 'Last delivery failed (' + w + '): ' + e; },
       larkOn: function (m) { return 'Feishu approvals — on, cards go to ' + m; },
       larkOff: 'Feishu approvals — off',
+      adbOn: 'Connected', adbOnSay: 'Elevated commands run through Wireless debugging.',
+      adbNoPort: 'Wireless debugging is off',
+      adbNoPortSay: 'Turn it on under Settings → Developer options → Wireless debugging on the phone. Android turns it off on a reboot, when Wi-Fi drops or on another access point; once it is back on, this reconnects without pairing again.',
+      adbUnpaired: 'Pairing lapsed',
+      adbUnpairedSay: 'Wireless debugging is on but does not accept wanctl\'s key: it was never paired here, or Android revoked the pairing (it does after 7 days unused).',
+      adbOff: 'Elevation is off in the app',
+      adbOffSay: 'Turn on 提权通道 under Settings → Advanced in the wanctl app on the phone; the connection shows here after that.',
+      adbConfirm: 'Waiting for you to allow on the phone',
+      adbConfirmSay: 'The phone should be showing "Allow USB debugging?" for wanctl. Tap Allow there; if you do not see it, pair again.',
+      adbErr: 'Cannot reach adb',
+      adbErrSay: 'adb on the phone did not answer properly. Pair again; if it still fails, send us the details below.',
+      adbRepair: 'Pair again', adbPair: 'Pair',
+      adbChecking: 'Paired. Checking the connection…',
+      phoneOn: 'Approval phone — this one', phoneOff: 'Approval phone — off',
+      phoneHint: 'When no portal page is open, requests no rule covers are pushed to this phone and wait up to 3 minutes. Approve one after that and the same command is let through once within 30 minutes.',
+      phoneElsewhere: function (d) { return 'Your approval phone is ' + d + '. Switching it on here moves it to this one.'; },
+      phoneOnline: 'Online: requests are pushed here and wait up to 3 minutes. The lock screen only says "有 1 个待审批请求"; the command shows after unlock.',
+      phoneOffline: 'Not reachable right now: requests are refused at once, as before, until the phone is back.',
+      phoneSent: 'A test notification is on its way. If the lock screen does not show it, open wanctl on the phone and turn on lock screen and banners for approvals.',
+      ePhoneUnreachable: 'The phone did not answer. Open wanctl on it and wait until it says connected.',
+      ePhoneIncapable: 'This device cannot receive approvals. It needs the wanctl Android app, updated to the latest version.',
       notifyDevOn: 'Webhook notifications — on', notifyDevOff: 'Webhook notifications — off',
       removeDevT: 'Remove this device?',
       removeDevM: function (d) { return d + ' leaves your namespace. Running wanctl on that machine again brings it back.'; },
@@ -184,6 +218,21 @@
       noTrusted: '还没有信任任何控制端。',
       noRules: '还没有规则，每条请求都会问你。',
       noLog: '还没有活动记录。',
+      connected: '建立连接',
+      times: function (n) { return ' · ' + n + ' 次'; },
+      // 设备日志里的裁决是设备写的英文原值；中文界面逐个翻，没见过的原样显示。
+      verdicts: {
+        'accepted': '已接受', 'approved': '已批准', 'late-approved': '事后批准',
+        'pre-approved': '规则放行', 'bypass': '免审批',
+        'remembered:dir': '已批准并记住（本目录）', 'remembered:global': '已批准并记住（全局）',
+        'denied': '已拒绝', 'finished': '已结束', 'console': '控制台操作',
+        'auto-trust': '自动信任', 'delegation inactive': '委托已失效',
+        'workspace access inactive': '工作区授权已失效', 'unsupported-capability': '不支持的操作',
+        'rejected:unpaired': '拒绝：未配对', 'rejected:unlabeled': '拒绝：控制端没有标识',
+        'rejected:capability': '拒绝：权限不够', 'rejected:delegation': '拒绝：委托无效',
+        'rejected:not-console-admin': '拒绝：不是控制台管理员', 'rejected:pairing-full': '拒绝：待配对已满',
+        'rejected:session': '拒绝：会话无效', 'rejected:workspace-access': '拒绝：没有工作区授权'
+      },
       noTokens: '还没有令牌。',
       noInvites: '还没有邀请。',
       noFriends: '还没有好友。',
@@ -199,9 +248,10 @@
       rulePlaceholder: 'echo *   或   /data',
       issue: '签发', label: '标签', labelPlaceholder: 'laptop、ci…',
       expiry: '多少天后过期（0 = 永不）',
-      newInvite: '新建邀请', inviteLogin: 'GitHub 用户名（可选）',
-      invitePlaceholder: '填了就预录对方；留空则生成一次性邀请码',
-      inviteCode: '邀请码', invitePre: '已预录', invitePending: '待使用', inviteUsed: '已用于',
+      newInvite: '新建邀请', inviteLogin: 'GitHub 用户名',
+      invitePlaceholder: '对方用这个 GitHub 账号登录即自动获准',
+      inviteNeedLogin: '请填写要邀请的 GitHub 用户名。',
+      inviteCode: '邀请码（已停用）', invitePre: '已预录', invitePending: '待使用', inviteUsed: '已用于',
       reqWants: '申请访问', approve: '通过',
       reqOK: '已通过 —— 这个登录名现在有邀请了。', reqNo: '已拒绝。',
       addFriend: '加好友', friendNS: '对方的用户名（命名空间）', send: '发送请求',
@@ -223,8 +273,18 @@
       eNoFriend: '这不是你的好友。',
       eNotFriends: '你们还不是好友。',
       ePending: '这条邀请还没被接受。',
+      eDisabled: '此账号已停用，请联系运营方。',
+      emailNone: '还没有确认过的邮箱。',
+      emailSent: function (a) { return '已发送。去 ' + a + ' 点开信里的链接。'; },
+      emailDropped: '已取消修改，邮箱保持不变。',
+      'email-invalid': '邮箱格式不对。',
+      'email-unchanged': '这已经是你现在的邮箱了。',
+      'rate-address': '刚给这个地址发过一封，过几分钟再试。',
+      'rate-identity': '今天发得太多了，明天再试。',
+      'mail-failed': '信没发出去。检查一下地址，或者稍后再试。',
       eBadCode: '这个码不对。',
       ePairGone: '这条配对请求已经过期或被人答过了。让 AI 再试一次。',
+      eRequestGone: '这条请求已被处理或已过期，这次操作没有生效。',
       failedGeneric: '没成功。',
       failedCode: '失败：',
       aliasTaken: '这个别名已经指向另一台设备了。',
@@ -236,6 +296,27 @@
       lastFail: function (w, e) { return '最近一次投递失败（' + w + '）：' + e; },
       larkOn: function (m) { return '飞书审批 —— 已开启，卡片推给 ' + m; },
       larkOff: '飞书审批 —— 已关闭',
+      adbOn: '已连通', adbOnSay: '提权命令经无线调试执行。',
+      adbNoPort: '无线调试没开',
+      adbNoPortSay: '在手机「设置 → 开发者选项 → 无线调试」打开它。重启、断开 Wi-Fi 或换了接入点，系统都会关掉它；重新打开后会自动恢复，不用重新配对。',
+      adbUnpaired: '配对失效',
+      adbUnpairedSay: '无线调试开着，但不认 wanctl 的密钥：这台手机还没配对过，或者配对已被系统撤销（7 天没用会自动撤销）。',
+      adbOff: '手机 App 里的提权通道没打开',
+      adbOffSay: '在手机 wanctl 的「设置 → 高级设置」打开「提权通道」，这里才会显示连接状态。',
+      adbConfirm: '等你在手机上点允许',
+      adbConfirmSay: '手机上应该弹出了「允许 USB 调试吗」的授权框，在手机上点允许。没看到就点「重新配对」。',
+      adbErr: '连不上 adb',
+      adbErrSay: '手机上的 adb 没有正常应答。点「重新配对」再试一次；还不行，把下面的详情发给我们。',
+      adbRepair: '重新配对', adbPair: '配对',
+      adbChecking: '配对成功，正在确认连接…',
+      phoneOn: '审批手机 —— 就是这台', phoneOff: '审批手机 —— 未设置',
+      phoneHint: '没开门户页面时，未命中规则的操作会推到这台手机上批，最多等 3 分钟。过了 3 分钟再点允许，同一条命令 30 分钟内放行一次。',
+      phoneElsewhere: function (d) { return '现在的审批手机是 ' + d + '，在这里打开会改成这台。'; },
+      phoneOnline: '在线：请求会推到这台手机，最多等 3 分钟。锁屏上只显示「有 1 个待审批请求」，解锁后才看得到命令。',
+      phoneOffline: '现在连不上：手机回来之前，请求照旧立即拒绝。',
+      phoneSent: '已向手机发了一条测试提醒。锁屏上看不到的话，在手机上打开 wanctl，按提示打开待审批通知的锁屏和横幅。',
+      ePhoneUnreachable: '手机没有响应。先在手机上打开 wanctl，等它显示已连接。',
+      ePhoneIncapable: '这台设备收不了审批提醒：要装 wanctl 安卓 app，并更新到最新版。',
       notifyDevOn: 'Webhook 通知 —— 已开启', notifyDevOff: 'Webhook 通知 —— 已关闭',
       removeDevT: '解除这台设备？',
       removeDevM: function (d) { return d + ' 会离开你的命名空间。在那台机器上重新运行 wanctl 可再次纳管。'; },
@@ -279,6 +360,8 @@
     });
     try { localStorage.setItem('wanctl.lang', l); } catch (_) {}
     repaint();
+    // 活动日志不在 repaint() 里：用手上那份重画，裁决和「建立连接」跟着换语言。
+    if (shownLog) paintLog(shownLog);
     // <th> 的文字刚换过，格子上的列名要跟着换 —— repaint() 只重画一部分表，
     // 活动日志那张就不在里面。
     relabel();
@@ -383,11 +466,20 @@
     not_found: 'eNotFound',
     bad_verification_code: 'eBadCode',
     pairing_gone: 'ePairGone',
+    request_gone: 'eRequestGone',
+    approval_phone_unreachable: 'ePhoneUnreachable',
+    approval_phone_incapable: 'ePhoneIncapable',
     'no-such-user': 'eNoUser',
     'no-such-friend': 'eNoFriend',
     'not-friends': 'eNotFriends',
     'invalid-friend': 'eNotFriends',
-    'pending-invite': 'ePending'
+    'pending-invite': 'ePending',
+    'account-disabled': 'eDisabled',
+    'email-invalid': 'email-invalid',
+    'email-unchanged': 'email-unchanged',
+    'rate-address': 'rate-address',
+    'rate-identity': 'rate-identity',
+    'mail-failed': 'mail-failed'
   };
 
   function errCode(e) {
@@ -570,7 +662,11 @@
       if (el) el.classList.add('gone');
       toast(v === 'n' ? t().refused : t().allowed, v === 'n');
       setTimeout(refreshAsks, 340);
-    }).catch(oops);
+    }).catch(function (e) {
+      // 404 request_gone：审批手机或别处先答了，这张卡已经作废，重读一遍。
+      oops(e);
+      setTimeout(refreshAsks, 340);
+    });
   }
   function pairDecide(dev, fp, v, el) {
     if (adminGuard(dev)) return;
@@ -870,6 +966,9 @@
     if (!st || !st.mode) return;
     lastState = st;
     $('#dsAdb').hidden = !(st.info && st.info.adb_pair) || !!(devMeta[cur] || {}).shared;   // 属主专属，与 manage 无关
+    paintAdb(st.adb);
+    // 审批手机只能是自己的安卓设备：只有 app 托管的 agent 收得了推送（ADR 0015）
+    $('#dsPhone').hidden = !(st.info && st.info.platform === 'android') || !!(devMeta[cur] || {}).shared;
     curMode = st.mode;
     setModeUI(st.mode);
 
@@ -1068,23 +1167,47 @@
     });
   };
 
+  // 中文界面把裁决原值换成中文；英文界面照旧显示原值。
+  // 「denied: 原因」这种带原因的，只翻前缀，原因是设备写的，原样留着。
+  function verdictText(dec) {
+    var zh = t().verdicts;
+    if (!dec || !zh) return dec || '—';
+    if (zh[dec]) return zh[dec];
+    var m = /^denied: (.+)$/.exec(dec);
+    return m ? zh.denied + '：' + m[1] : dec;
+  }
+  // 合并过的连接（同一来源连续 n 次）显示成一段时间：同一天只写一次日期。
+  function logWhen(e) {
+    if (!e.count || !e.first_ts) return fmt(e.ts);
+    var a = fmt(e.first_ts), b = fmt(e.ts);
+    return a.slice(0, 10) === b.slice(0, 10) ? a + '–' + b.slice(11) : a + ' – ' + b;
+  }
+
+  // 最近一次取到的活动日志：切换语言时用它重画，不再去设备取一次。
+  var shownLog = null;
+  function paintLog(xs) {
+    shownLog = xs;
+    $('#devlog').innerHTML = xs.length ? xs.map(function (e) {
+      var dec = e.decision || '';
+      // 退出码由设备控制，必须转义（审计 2026-08-28, SEC-C-01）
+      var exit = (e.exit === 0 || e.exit) ? esc('' + e.exit) : '—';
+      return '<tr><td>' + esc(logWhen(e)) + '</td>' +
+        '<td class="mono">' + esc((e.detail || (e.type === 'connect' && dec === 'accepted' ? t().connected : '—')) +
+          (e.count > 1 ? t().times(e.count) : '')) +
+          (e.cwd ? '<span class="sub">' + esc(e.cwd) + '</span>' : '') + '</td>' +
+        '<td>' + esc(cut(e.peer_name || e.peer_fp || '—', 20)) + '</td>' +
+        '<td' + (/den/i.test(dec) ? ' class="no"' : '') + '>' + esc(verdictText(dec)) + '</td>' +
+        '<td class="num">' + exit + '</td></tr>';
+    }).join('') : '<tr><td colspan="5" class="tempty">' + esc(t().noLog) + '</td></tr>';
+    relabel();
+  }
+
   function loadLog() {
     if (!cur) return;
+    shownLog = null;
     $('#devlog').innerHTML = '<tr><td colspan="5" class="tempty">' + esc(t().loading) + '</td></tr>';
     jget('/api/devices/logs?device=' + encodeURIComponent(cur)).then(function (d) {
-      var xs = (d.logs || []).slice().reverse();
-      $('#devlog').innerHTML = xs.length ? xs.map(function (e) {
-        var dec = e.decision || '';
-        // 退出码由设备控制，必须转义（审计 2026-08-28, SEC-C-01）
-        var exit = (e.exit === 0 || e.exit) ? esc('' + e.exit) : '—';
-        return '<tr><td>' + esc(fmt(e.ts)) + '</td>' +
-          '<td class="mono">' + esc(e.detail || '—') +
-            (e.cwd ? '<span class="sub">' + esc(e.cwd) + '</span>' : '') + '</td>' +
-          '<td>' + esc(cut(e.peer_name || e.peer_fp || '—', 20)) + '</td>' +
-          '<td' + (/den/i.test(dec) ? ' class="no"' : '') + '>' + esc(dec || '—') + '</td>' +
-          '<td class="num">' + exit + '</td></tr>';
-      }).join('') : '<tr><td colspan="5" class="tempty">' + esc(t().noLog) + '</td></tr>';
-      relabel();
+      paintLog((d.logs || []).slice().reverse());
     }).catch(function (e) {
       $('#devlog').innerHTML = '<tr><td colspan="5" class="tempty">' + esc(t().cantReach) + '</td></tr>';
       oops(e);
@@ -1125,7 +1248,73 @@
       if (cur !== name) return;
       devNotify = c; $('#dsNotify').hidden = false; paintDevNotify();
     }).catch(function () { $('#dsNotify').hidden = true; });
+    loadPhone(name);
   }
+
+  /* 审批手机：每个命名空间一台，开关在那台安卓设备的设置里 */
+  var phone = {}, phoneBusy = false;
+  function loadPhone(name) {
+    jget('/api/approval-phone').then(function (c) {
+      if (cur !== name) return;
+      phone = c; paintPhone();
+    }).catch(function () { $('#dsPhone').hidden = true; });
+  }
+  function paintPhone(extra) {
+    var mine = !!phone.device && phone.device === cur;
+    $('#dsPhoneSw').className = 'sw' + (mine ? ' on' : '');
+    $('#dsPhoneTxt').textContent = mine ? t().phoneOn : t().phoneOff;
+    var note = $('#dsPhoneNote');
+    note.className = 'note' + (mine && !phone.online && !extra ? ' warn' : '');
+    note.textContent = extra || (mine ? (phone.online ? t().phoneOnline : t().phoneOffline)
+      : (phone.device ? t().phoneElsewhere(devName(phone.device).label) : t().phoneHint));
+  }
+  $('#dsPhoneSw').onclick = function () {
+    if (!cur || roGuard(cur) || phoneBusy) return;
+    var name = cur, on = phone.device !== cur;
+    phoneBusy = true;
+    jpost('/api/approval-phone', { device: on ? name : '' }).then(function () {
+      if (cur !== name) return;
+      phone = { device: on ? name : '', online: on };
+      paintPhone(on ? t().phoneSent : '');
+    }).catch(function (e) {
+      if (cur !== name) return;
+      var k = errSay[errCode(e)];
+      paintPhone(k ? t()[k] : t().failedGeneric);
+      $('#dsPhoneNote').className = 'note warn';
+    }).finally(function () { phoneBusy = false; });
+  };
+  /* ADB 常驻状态（v0.20.2）。agent 每分钟、端口一变、配对一完成就探一次 adb，
+     随控制台快照带过来；手机 App 的提权通道那一行用的是同一个值。旧 agent
+     不带 adb 字段，只摆配对表单，和以前一样。 */
+  var adbFormFor = null;   // 点了「配对 / 重新配对」的那台设备；换设备就收起
+  var adbKey = { connected: 'On', no_port: 'NoPort', unpaired: 'Unpaired', confirm: 'Confirm', off: 'Off' };
+  function paintAdb(link) {
+    var row = $('#dsAdbState'), box = $('#dsAdbPairBox'), rp = $('#dsAdbRepair');
+    if (!link) { row.hidden = true; box.hidden = false; return; }
+    var k = adbKey[link.state] || 'Err', fix = k === 'Unpaired' || k === 'Confirm' || k === 'Err';
+    if (k === 'On' && adbFormFor === cur) { adbFormFor = null; $('#dsAdbResult').textContent = ''; }
+    var open = adbFormFor === cur;
+    row.hidden = false;
+    row.className = 'row adb-state' + (k === 'On' ? ' on' : '');
+    $('#dsAdbDot').hidden = k === 'On';
+    $('#dsAdbDot').className = 'dot off';
+    $('#dsAdbOk').toggleAttribute('hidden', k !== 'On');   // SVG 没有 .hidden 属性，只认这个 attribute
+    $('#dsAdbHead').textContent = t()['adb' + k];
+    $('#dsAdbSay').textContent = t()['adb' + k + 'Say'];
+    // 原始报错是英文、给排查用的，折叠起来，不当成给主人看的那句话。
+    $('#dsAdbWhy').hidden = k !== 'Err' || !link.reason;
+    $('#dsAdbReason').textContent = link.reason || '';
+    rp.hidden = k === 'On' || open;
+    rp.textContent = fix ? t().adbRepair : t().adbPair;
+    rp.className = fix ? 'btn' : 'btn soft';
+    box.hidden = !open;
+  }
+  $('#dsAdbRepair').onclick = function () {
+    if (!cur || roGuard(cur)) return;
+    adbFormFor = cur;
+    paintAdb(lastState && lastState.adb);
+    $('#dsAdbPort').focus();
+  };
   var adbPairBusy = false;
   $('#dsAdbForm').onsubmit = function (event) {
     event.preventDefault();
@@ -1140,7 +1329,8 @@
     $('#dsAdbCode').value = '';
     jpost('/api/devices/adb-pair', { device:name, port:port, code:code }).then(function () {
       if (cur !== name) return;
-      result.textContent = lang === 'zh' ? '配对成功。请保持无线调试开启，并在手机 App 中启用提权通道。' : 'Paired. Keep Wireless debugging on and enable elevation in the phone app.';
+      // 有状态行的 agent 几秒内就报回结果；旧 agent 只能靠这一句提醒。
+      result.textContent = lastState && lastState.adb ? t().adbChecking : (lang === 'zh' ? '配对成功。请保持无线调试开启，并在手机 App 中启用提权通道。' : 'Paired. Keep Wireless debugging on and enable elevation in the phone app.');
     }).catch(function (error) {
       if (cur !== name) return;
       result.textContent = (lang === 'zh' ? '配对失败，请重新打开配对码弹窗后重试。' : 'Pairing failed. Open a new pairing-code dialog and retry.') + ' ' + error.message;
@@ -1227,7 +1417,7 @@
 
   var curSet = 'tokens';
   var setLoaders = {
-    tokens: loadTokens, notify: loadNotify,
+    tokens: loadTokens, notify: loadNotify, email: loadEmail,
     invites: function () { loadRequests(); return loadInvites(); },
     friends: loadFriends, acl: loadACL, downloads: loadDownloads, audit: loadAudit
   };
@@ -1237,6 +1427,7 @@
   function allowedSet(s) {
     if (!setLoaders[s]) return 'tokens';
     if (s === 'invites' && !(me && me.role === 'admin')) return 'tokens';
+    if (s === 'email' && !(me && me.mail)) return 'tokens';
     return s;
   }
   // 设置有两级，空的那一级就是清单本身：`#settings` 是清单，
@@ -1309,7 +1500,63 @@
     };
   }
   copier($('#tCopy'), '#tVal');
-  copier($('#iCopy'), '#iVal');
+
+  /* ── 邮箱 ──────────────────────────────────────────────────────────
+     地址归中继管，这里只读、发确认信、撤回没确认的修改；确认在信里那个
+     链接上完成。卡片的样子只由 data-mode 决定：view / edit / pending。
+
+     有一封确认信在路上时，这一节隔几秒自己再问一次：人多半在手机上点链接，
+     桌面上开着的这一页不该还要人回来刷新才看到新地址。 */
+  var emailTimer = null, emailPending = '';
+  function emailMode(m) { $('#eCard').dataset.mode = m; }
+  function loadEmail() {
+    clearTimeout(emailTimer);
+    jget('/auth/email/status').then(function (c) {
+      $('#eCur').textContent = c.confirmed || t().emailNone;
+      emailPending = c.pending || '';
+      $('#ePendAddr').textContent = emailPending;
+      // 正在改的时候不打断：轮询只更新文字，不把展开的输入框收起来。
+      if ($('#eCard').dataset.mode !== 'edit') emailMode(emailPending ? 'pending' : 'view');
+      if (emailPending) {
+        emailTimer = setTimeout(function () {
+          if (curSet === 'email' && $('[data-view="settings"]').classList.contains('show')) loadEmail();
+        }, 5000);
+      }
+    }).catch(oops);
+  }
+  function sendEmail(address, btn) {
+    btn.disabled = true;
+    return jpost('/auth/email/send', { address: address, next: '/#settings/email' }).then(function (r) {
+      return r.json();
+    }).then(function (b) {
+      toast(t().emailSent(b.address || address));
+      $('#eIn').value = '';
+      emailMode('pending');
+      loadEmail();
+    }).catch(oops).then(function () { btn.disabled = false; });
+  }
+  $('#eEdit').onclick = function () {
+    emailMode('edit');
+    $('#eIn').focus();
+  };
+  $('#eCancel').onclick = function () {
+    $('#eIn').value = '';
+    emailMode(emailPending ? 'pending' : 'view');
+  };
+  $('#eSend').onclick = function () {
+    var address = $('#eIn').value.trim();
+    if (!address) { $('#eIn').focus(); return; }
+    sendEmail(address, $('#eSend'));
+  };
+  $('#eIn').onkeydown = function (e) { if (e.key === 'Enter') $('#eSend').click(); };
+  $('#eResend').onclick = function () { if (emailPending) sendEmail(emailPending, $('#eResend')); };
+  $('#eDrop').onclick = function () {
+    $('#eDrop').disabled = true;
+    jpost('/auth/email/cancel', {}).then(function () {
+      toast(t().emailDropped);
+      loadEmail();
+    }).catch(oops).then(function () { $('#eDrop').disabled = false; });
+  };
 
   /* ── 通知 ────────────────────────────────────────────────────────── */
   var notify = {};
@@ -1367,6 +1614,7 @@
         '<span class="host">' + esc(r.login) + '</span>' +
         '<span class="what">' + esc(t().reqWants) + '</span>' +
         '<span class="wait">' + esc(ago(r.created_at)) + '</span></div>' +
+      (r.email ? '<div class="body"><p class="cmd">' + esc(r.email) + '</p></div>' : '') +
       (note ? '<div class="body"><p class="cmd" style="font-family:inherit">' + esc(note) + '</p></div>' : '') +
       '<div class="acts">' +
         '<button class="btn" data-rv="approved">' + esc(t().approve) + '</button>' +
@@ -1380,6 +1628,14 @@
       // 它本来就以一条邀请的形式留在下面那张表里。
       var xs = (d.requests || []).filter(function (r) { return r.status === 'pending'; });
       $('#reqs').innerHTML = xs.map(reqCard).join('');
+      // 入口那一行：几个人在等。一个都没有时整行藏起来，也收回去 ——
+      // 下一个申请来的时候，它该以一行入口的样子出现，而不是自己摊开。
+      $('#reqBox').hidden = !xs.length;
+      if (!xs.length) $('#reqBox').open = false;
+      var n = $('#reqN');
+      n.setAttribute('data-en', xs.length + ' waiting');
+      n.setAttribute('data-zh', xs.length + ' 个待处理');
+      n.textContent = n.getAttribute('data-' + lang);
       $$('#reqs .ask').forEach(function (el) {
         $$('.btn[data-rv]', el).forEach(function (b) {
           b.onclick = function () {
@@ -1428,13 +1684,12 @@
       { key: 'login', label: t().inviteLogin, hint: t().invitePlaceholder }
     ]).then(function (v) {
       if (!v) return;
-      jpost('/api/invites', { github_login: (v.login || '').trim() })
+      var login = (v.login || '').trim();
+      if (!login) return toast(t().inviteNeedLogin, true);
+      jpost('/api/invites', { github_login: login })
         .then(function (r) { return r.json(); })
-        .then(function (j) {
-          if (j.code) { $('#iVal').textContent = j.code; $('#iSlip').classList.add('show'); }
-          else toast(t().saved);
-          loadInvites();
-        }).catch(oops);
+        .then(function () { toast(t().saved); loadInvites(); })
+        .catch(oops);
     });
   };
 
@@ -1557,8 +1812,9 @@
   }
 
   /* ── 下载安装 ────────────────────────────────────────────────────────
-     版本与资产大小尽力从 GitHub API 拿 —— 门户服务器不一定够得着 GitHub，
-     浏览器这一侧通常可以；拿不到就退回固定的 latest 直链。
+     链接一律指向 GitHub 的 latest 直链。这里以前会先去问 GitHub API 要版本
+     和大小，但门户的 CSP（connect-src 'self'）从来不放行那次请求，页面一直
+     走的就是直链，还每次留一条违规，所以删了。
      安卓卡在最前面且最大：手机是唯一没有别的入口的平台，你没法在手机上
      curl 一个安装脚本。 */
   var dlDone = false;
@@ -1566,8 +1822,7 @@
   function loadDownloads() {
     if (dlDone) return;
     var GH = 'https://github.com/Daily-AC/wanctl', latest = GH + '/releases/latest/download';
-    fetch('https://api.github.com/repos/Daily-AC/wanctl/releases/latest')
-      .then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; })
+    Promise.resolve(null)
       .then(function (rel) {
         var assets = (rel && rel.assets) || [];
         var asset = function (n) { return assets.filter(function (a) { return a.name === n; })[0]; };
@@ -1888,7 +2143,14 @@
     me = m;
     paintWho(m);
     if (m.role === 'admin') $('#sInvites').hidden = false;
-  }).catch(function () {
+    if (m.mail) $('#sEmail').hidden = false;
+  }).catch(function (e) {
+    // 页面本身是门后面的，正常走不到这里；开着的旧标签页在门立起来之后
+    // 刷新数据时会碰到，送它去门页。
+    if (e && e.status === 403 && ('' + e.message).trim() === 'email-required') {
+      location.href = '/auth/email?next=%2F';
+      return;
+    }
     $('#who').hidden = false;
     $('#whoName').textContent = t().notSignedIn;
   });

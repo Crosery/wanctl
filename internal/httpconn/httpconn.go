@@ -32,6 +32,7 @@ package httpconn
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -54,14 +55,15 @@ type conn struct {
 	role        string
 	token       string
 	hc          *http.Client
-	laneClients [DownWindowSize]*http.Client
+	laneClients [laneCount]*http.Client
 	laneMu      sync.Mutex
-	laneBusy    [2][DownWindowSize]int // upload, download; lane 0 can multiplex small uploads
+	laneBusy    [2][laneCount]int // upload, download; lane 0 can multiplex small uploads
 	laneWake    chan struct{}
 
 	readM       sync.Mutex
 	leftover    []byte
 	eof         bool
+	endErr      error  // what Read returns at the end instead of io.EOF, when the relay said why
 	ackSeq      uint64 // highest down-poll sequence fully received
 	ackable     bool   // the relay has answered this session with the ack protocol
 	downMax     int    // bytes this reader asks one down poll to carry
@@ -90,6 +92,18 @@ type conn struct {
 
 const (
 	DownWindowSize = 4
+	// laneCount is how many relay connections a process moves session bytes
+	// over. Lane 0 is the one relayhttp.Shared keeps warm, and it carries what
+	// has to stay fast: an agent's /h/poll, every new session's handshake and
+	// every small write. Anything queued on that connection behind a bulk
+	// request waits for the bulk to cross the link first, on a slow uplink 8-22
+	// s per hop (a device serving a pull at 0.3-0.7 MB/s, 2026-10-13), long
+	// enough for the relay to take the agent's poll for silence and end every
+	// session it held. So bulk never takes lane 0: full upload batches and
+	// windowed downloads stripe over lanes 1..DownWindowSize, one lane per
+	// poll the download window keeps in flight, which is the four connections
+	// bulk had when it still shared lane 0.
+	laneCount = 1 + DownWindowSize
 	// writeBatchBytes is as much as the relay accepts in one /h/up. Upload is
 	// one request at a time, so it cannot move more than a batch per round
 	// trip: at the 0.5 s round trip of a CDN edge on another continent, 256 KiB
@@ -129,6 +143,10 @@ const (
 	// gated on having seen this (or a sequence header) on this session.
 	DownAckCapabilityHeader = "X-Wanctl-Down-Ack"
 
+	// SessionEndHeader rides on a 410 for a session the relay ended itself,
+	// naming why. "device-gone" is the one value a reader acts on today.
+	SessionEndHeader = "X-Wanctl-Session-End"
+
 	// DownMaxParam is the most bytes the reader wants in one down-poll
 	// response. A relay that does not know it answers with its own cap.
 	DownMaxParam = "max"
@@ -149,11 +167,28 @@ const (
 	downMaxFloor   = 2 << 20
 	downMaxCeiling = 16 << 20
 	downGrowWithin = 4 * time.Second
+
+	// laneZeroDownMax is the most a device's down poll without want asks for
+	// once the relay serves the download window. That poll rides lane 0, and
+	// on a device every byte of its answer delays the agent's /h/poll and
+	// every controller's handshake: the first 2 MiB of a push at 400 KB/s held
+	// a status up for 7.5 s. A full answer opens the window, which carries the
+	// rest over the bulk lanes, at the cost of a round trip on 256 KiB-1 MiB
+	// pushes. A controller does not cap it: its lane 0 carries only its own
+	// sessions, and capping cost every 256 KiB-2 MiB pull 0.2 s or more, its
+	// bulk lanes being cold in a fresh process.
+	laneZeroDownMax = 256 << 10
 )
 
 // downShrinkPast is how long a chunk may take before the next one is halved;
 // a variable so tests need not wait it out.
 var downShrinkPast = 30 * time.Second
+
+// ErrDeviceGone is what a session's reader gets when the relay ended the
+// session because the device's agent went offline or was restarted. It is not
+// io.EOF: the far side did not finish, and a controller waiting on a command
+// has to say so rather than report a clean end or a timeout.
+var ErrDeviceGone = errors.New("device disconnected: its agent went offline or restarted mid-session, so whatever it was running may or may not have finished")
 
 // Dial constructs a net.Conn for a session/role. base is the relay's HTTP origin
 // (http:// or https://, or ws(s):// which is normalized). No network I/O happens
@@ -187,7 +222,7 @@ func DialWith(ctx context.Context, base, session, role, token string, hc *http.C
 	c.closeCtx, c.closeCancel = context.WithCancel(context.Background())
 	c.laneClients[0] = hc
 	if explicit {
-		for i := 1; i < DownWindowSize; i++ {
+		for i := 1; i < laneCount; i++ {
 			c.laneClients[i] = hc
 		}
 	}
@@ -222,7 +257,7 @@ func defaultClient() *http.Client {
 
 var sharedLanes struct {
 	sync.Mutex
-	clients [DownWindowSize]*http.Client
+	clients [laneCount]*http.Client
 }
 
 func processLane(i int) *http.Client {
@@ -247,11 +282,12 @@ func (c *conn) laneClient(i int) *http.Client {
 	return c.laneClients[i]
 }
 
+// acquireLane takes a free bulk lane for one request in direction, trying
+// start first. It never hands out lane 0 (see laneCount).
 func (c *conn) acquireLane(direction, start int) int {
 	for {
 		c.laneMu.Lock()
-		for j := 0; j < DownWindowSize; j++ {
-			i := (start + j) % DownWindowSize
+		for i, j := start, 0; j < laneCount-1; i, j = nextBulkLane(i), j+1 {
 			if c.laneBusy[direction][i] == 0 {
 				c.laneBusy[direction][i] = 1
 				c.laneMu.Unlock()
@@ -263,6 +299,9 @@ func (c *conn) acquireLane(direction, start int) int {
 		<-wake
 	}
 }
+
+// nextBulkLane is the bulk lane after lane i, wrapping from the last to lane 1.
+func nextBulkLane(i int) int { return i%(laneCount-1) + 1 }
 
 func (c *conn) reserveLaneZero(direction int) {
 	c.laneMu.Lock()
@@ -292,7 +331,8 @@ type downResult struct {
 	status  int
 	ackable bool
 	window  bool
-	retried bool // a response body was cut short before this complete result
+	retried bool   // a response body was cut short before this complete result
+	end     string // SessionEndHeader on a 410
 	took    time.Duration
 	err     error
 }
@@ -309,7 +349,7 @@ type downBatch struct {
 // downPoll retries the same numbered chunk on a different lane after a
 // carrier failure. A poll without want keeps the legacy single-request shape.
 func (c *conn) downPoll(ctx context.Context, ack, want uint64, limit int, retryable bool) downResult {
-	nextLane := 0
+	nextLane := 1
 	hadBodyFailure := false
 	for attempt := 1; attempt <= downPollAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -332,6 +372,7 @@ func (c *conn) downPoll(ctx context.Context, ack, want uint64, limit int, retrya
 		result := downResult{want: want, max: limit}
 		if err == nil {
 			result.status = resp.StatusCode
+			result.end = resp.Header.Get(SessionEndHeader)
 			result.ackable = resp.Header.Get(DownAckCapabilityHeader) == "1"
 			result.window = resp.Header.Get(DownWindowCapabilityHeader) == "4"
 			result.seq, _ = strconv.ParseUint(resp.Header.Get(DownSeqHeader), 10, 64)
@@ -366,7 +407,7 @@ func (c *conn) downPoll(ctx context.Context, ack, want uint64, limit int, retrya
 			return downResult{want: want, err: fmt.Errorf("down poll failed %d times in a row: %w", attempt, err)}
 		}
 		retryable = true
-		nextLane = (lane + 1) % DownWindowSize
+		nextLane = nextBulkLane(lane)
 		select {
 		case <-time.After(downRetryDelay):
 		case <-ctx.Done():
@@ -439,9 +480,17 @@ func (c *conn) Read(p []byte) (int, error) {
 	if len(c.leftover) > 0 {
 		n := copy(p, c.leftover)
 		c.leftover = c.leftover[n:]
+		if len(c.leftover) == 0 {
+			// An empty tail still points into the chunk; drop it so the
+			// chunk is freed now rather than when the next one arrives.
+			c.leftover = nil
+		}
 		return n, nil
 	}
 	if c.eof {
+		if c.endErr != nil {
+			return 0, c.endErr
+		}
 		return 0, io.EOF
 	}
 	for {
@@ -456,7 +505,11 @@ func (c *conn) Read(p []byte) (int, error) {
 		if windowed {
 			r = c.nextBatchResult()
 		} else {
-			r = c.downPoll(c.closeCtx, c.ackSeq, 0, c.downMax, c.ackable)
+			limit := c.downMax
+			if c.role == "agent" && c.downWindow.Load() {
+				limit = min(limit, laneZeroDownMax)
+			}
+			r = c.downPoll(c.closeCtx, c.ackSeq, 0, limit, c.ackable)
 		}
 		if r.err != nil {
 			if windowed {
@@ -516,6 +569,10 @@ func (c *conn) Read(p []byte) (int, error) {
 				c.stopBatch()
 			}
 			c.eof = true
+			if r.end == "device-gone" {
+				c.endErr = ErrDeviceGone
+				return 0, ErrDeviceGone
+			}
 			return 0, io.EOF
 		default:
 			if windowed {
@@ -561,10 +618,14 @@ func (c *conn) Write(p []byte) (int, error) {
 	if len(c.pending) > 0 && c.flushTimer == nil {
 		c.flushGen++
 		gen := c.flushGen
-		c.flushTimer = time.AfterFunc(writeFlushDelay, func() { c.flushTimerFired(gen) })
+		c.flushTimer = afterFunc(writeFlushDelay, func() { c.flushTimerFired(gen) })
 	}
 	return len(p), nil
 }
+
+// afterFunc arms the write flush timer. Tests replace it to decide when the
+// delay has passed instead of racing the scheduler against 5 ms.
+var afterFunc = time.AfterFunc
 
 func (c *conn) flushTimerFired(gen uint64) {
 	c.writeM.Lock()
@@ -637,7 +698,7 @@ func (c *conn) sendLocked(n int) error {
 func (c *conn) post(seq uint64, data []byte) error {
 	q := url.Values{"session": {c.session}, "role": {c.role}, UpSeqParam: {strconv.FormatUint(seq, 10)}}
 	var lastErr error
-	nextLane := 0
+	nextLane := 1
 	for attempt := 1; attempt <= upAttempts; attempt++ {
 		if attempt > 1 {
 			if !c.upOrdered.Load() {
@@ -654,7 +715,8 @@ func (c *conn) post(seq uint64, data []byte) error {
 		ordered := c.upOrdered.Load()
 		// Small requests share the already warm HTTP/2 lane, even when the
 		// handshake and command pipeline puts several of them in flight.
-		// Only full upload batches justify opening another relay connection.
+		// Only full upload batches justify opening another relay connection,
+		// and they never share that lane (see laneCount).
 		striped := ordered && len(data) == writeBatchBytes
 		lane := 0
 		if striped {
@@ -668,7 +730,7 @@ func (c *conn) post(seq uint64, data []byte) error {
 			lastErr = err
 			c.closeFailedLane(lane)
 			c.releaseLane(0, lane)
-			nextLane = (lane + 1) % DownWindowSize
+			nextLane = nextBulkLane(lane)
 			continue
 		}
 		if resp.Header.Get(UpSeqCapabilityHeader) == "1" {
@@ -680,7 +742,7 @@ func (c *conn) post(seq uint64, data []byte) error {
 		if bodyErr != nil {
 			lastErr = bodyErr
 			c.closeFailedLane(lane)
-			nextLane = (lane + 1) % DownWindowSize
+			nextLane = nextBulkLane(lane)
 			continue
 		}
 		switch {
@@ -689,7 +751,7 @@ func (c *conn) post(seq uint64, data []byte) error {
 		case resp.StatusCode >= 500:
 			lastErr = fmt.Errorf("up chunk: relay returned %d", resp.StatusCode)
 			c.closeFailedLane(lane)
-			nextLane = (lane + 1) % DownWindowSize
+			nextLane = nextBulkLane(lane)
 			continue
 		default:
 			// 4xx is the relay refusing the write, not the carrier losing it.

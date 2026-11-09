@@ -22,13 +22,14 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+	"unicode"
 
 	"wanctl/internal/admission"
 	"wanctl/internal/androidverb"
 	"wanctl/internal/config"
 	"wanctl/internal/console"
+	"wanctl/internal/desktop"
 	"wanctl/internal/elevate"
 	"wanctl/internal/eventlog"
 	"wanctl/internal/httpconn"
@@ -37,6 +38,7 @@ import (
 	"wanctl/internal/relayhttp"
 	"wanctl/internal/server"
 	"wanctl/internal/sessionauth"
+	"wanctl/internal/termsafe"
 	"wanctl/internal/transport"
 	"wanctl/internal/wsconn"
 
@@ -55,10 +57,16 @@ type Options struct {
 	PortalFP  string      // deprecated single portal admin fingerprint
 	PortalFPs []string    // pre-trusted portal admin fingerprints, enrolled locally
 	Version   string      // immutable release version reported to controllers
+
+	// ApprovalsStdio makes this agent an approval phone (ADR 0015): approval
+	// cards go out on stdout and the owner's decisions come in on stdin. Only
+	// the Android app, which runs the agent as its child, sets it.
+	ApprovalsStdio bool
 }
 
 // Agent is a running controlled node.
 type Agent struct {
+	desktop      desktop.Service
 	deviceID     string
 	id           *transport.Identity
 	known        *transport.Store
@@ -79,13 +87,16 @@ type Agent struct {
 	workspaceMu      sync.Mutex
 	workspaces       map[string]*workspace
 	workspacesClosed bool
-	// consoles counts live console sessions. An update that swapped the binary
-	// under an owner who is mid-approval would drop the connection they are
-	// answering on.
-	consoles atomic.Int64
-	jobs     *jobStore
-	stdin    *bufio.Reader
-	elevator *elevate.Manager
+	workspaceLinks   int // reusable workspace connections being served
+	jobs             *jobStore
+	elevator         *elevate.Manager
+
+	// phone is the stdio link to the Android app, nil unless the agent runs
+	// with Options.ApprovalsStdio; grants are late approvals, which any device
+	// can hold (approvals.go).
+	phone  *approvalPhone
+	grants lateGrants
+	adb    adbLinkState
 
 	// Owned goroutines. Every goroutine the agent starts is registered in wg
 	// and takes its context from stopCtx, so Close can cancel them all and then
@@ -260,12 +271,16 @@ func New(opts Options) (*Agent, error) {
 	a := &Agent{
 		deviceID: deviceID, id: id, known: known, portalAdmins: portalAdmins, opts: opts, engine: engine, log: logger,
 		inst:     inst,
-		sessions: map[string]*server.ShellSession{}, jobs: newJobStore(), stdin: bufio.NewReader(os.Stdin),
+		sessions: map[string]*server.ShellSession{}, jobs: newJobStore(),
 		elevator: elevate.ConfigureDefault(configDirOrEmpty(), os.Getenv),
+		adb:      adbLinkState{kick: make(chan struct{}, 1)},
 	}
 	// Shutdown context for everything the agent starts; Close cancels it and
 	// then joins those goroutines.
 	a.stopCtx, a.stop = context.WithCancel(context.Background())
+	if opts.ApprovalsStdio {
+		a.phone = newApprovalPhone(os.Stdout, os.Stdin, a.stopCtx.Done())
+	}
 	a.console = console.New(engine, logger, console.Info{
 		Device: opts.Name, Fingerprint: id.Fingerprint, Relay: opts.RelayURL,
 		Platform: runtime.GOOS, ADBPair: runtime.GOOS == "android",
@@ -331,9 +346,10 @@ func (a *Agent) gateDataCapability(cap dataCapability, peerFP string, checks ...
 	}
 }
 
-// gate authorizes a request: bypass/pre-approved pass; otherwise ask the
-// approver and optionally remember a rule. Returns whether the op may proceed
-// and a short decision string for the audit log.
+// gate authorizes a request: bypass/pre-approved pass, then a late approval
+// the owner already gave; otherwise ask the approver and optionally remember a
+// rule. Returns whether the op may proceed and a short decision string for the
+// audit log.
 func (a *Agent) gate(req policy.Request, checks ...func() bool) (bool, string) {
 	// Bypasses, not Mode()==bypass: an elevated command rides the blanket allow
 	// only on a device whose elevation channel is also switched on. Two opt-ins,
@@ -344,6 +360,10 @@ func (a *Agent) gate(req policy.Request, checks ...func() bool) (bool, string) {
 	if a.engine.Allowed(req) {
 		return true, "pre-approved"
 	}
+	if ok, decision, handled := a.useLateGrant(req, checks); handled {
+		return ok, decision
+	}
+	a.grants.asked(req)
 	a.apprMu.Lock()
 	appr := a.appr
 	a.apprMu.Unlock()
@@ -379,6 +399,14 @@ func (a *Agent) gateFile(req policy.Request, checks ...func() bool) (bool, strin
 	if root, ok := a.engine.AllowedFileRoot(req); ok {
 		return true, "pre-approved", root
 	}
+	// A late approval is a one-shot approval that arrived late, so it gets
+	// the same root.
+	if ok, decision, handled := a.useLateGrant(req, checks); handled {
+		if !ok {
+			return false, decision, ""
+		}
+		return true, decision, filepath.Dir(req.Path)
+	}
 	a.apprMu.Lock()
 	appr := a.appr
 	a.apprMu.Unlock()
@@ -410,6 +438,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer cancel()
 
 	a.spawn(func() { a.runNotifyPolicy(ctx) })
+	a.spawn(func() { a.watchADBLink(ctx) })
+	if a.phone != nil {
+		a.spawn(func() { a.phone.serveDecisions(ctx) })
+	}
 	if a.opts.Transport == "http" {
 		return a.runHTTP(ctx)
 	}
@@ -430,7 +462,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		return err
 	}
 	fmt.Printf("wanctl agent %q online via %s\n  fingerprint: %s\n", a.opts.Name, a.opts.RelayURL, a.id.Fingerprint)
-	if term.IsTerminal(int(os.Stdin.Fd())) {
+	// On an approval phone stdin carries the app's decisions, and a prompt
+	// reading it would swallow them.
+	if a.phone == nil && term.IsTerminal(int(os.Stdin.Fd())) {
 		a.spawn(func() { a.runConsolePrompt(ctx) })
 	}
 
@@ -532,6 +566,11 @@ func (a *Agent) handleSession(ctx context.Context, nc net.Conn, auth sessionauth
 	if hello.Kind != protocol.KindHello && hello.Kind != protocol.KindConsoleHello && hello.Kind != protocol.KindWorkspaceHello {
 		return
 	}
+	// A controller names and describes itself. Both reach the owner — pairing
+	// cards, the trust list, logs, notifications — and are kept in
+	// known_clients.json, so control characters are dropped here, where the
+	// text first arrives, rather than by every place that later shows it.
+	hello.Name, hello.Label = peerText(hello.Name), peerText(hello.Label)
 	if !auth.ValidFor(a.DeviceID()) {
 		a.refuse(conn, fp, hello.Name, "rejected:session", protocol.Message{Kind: protocol.KindReject, Reason: "invalid relay session capabilities"}, audit)
 		return
@@ -565,7 +604,13 @@ func (a *Agent) handleSession(ctx context.Context, nc net.Conn, auth sessionauth
 	// Authorize (TOFU / pre-trusted portal key) and reply OK for BOTH exec and
 	// console sessions BEFORE serving — the controller/portal blocks on this OK,
 	// and a console session must be gated by the same trust check as an exec one.
-	if !a.authorize(fp, hello.Name, hello.Label, audit) {
+	if trusted, err := a.authorize(fp, hello.Name, hello.Label, audit); !trusted {
+		if errors.Is(err, console.ErrTooManyPairings) {
+			// Nothing was queued, so there is nothing a pairing link could
+			// approve. The refusal itself is the record of the attempt.
+			a.refuse(conn, fp, hello.Name, "rejected:pairing-full", protocol.Message{Kind: protocol.KindReject, Reason: err.Error()}, audit)
+			return
+		}
 		pairingURL := a.pairingURL(fp, hello.Name, hello.Label)
 		reason := "device has not paired this controller — ask the user to approve"
 		if pairingURL == "" {
@@ -594,6 +639,9 @@ func (a *Agent) handleSession(ctx context.Context, nc net.Conn, auth sessionauth
 	var check func() bool
 	if auth.GrantID != "" {
 		check = func() bool { return a.delegationActive(ctx, auth, fp) }
+	}
+	if hello.Kind == protocol.KindWorkspaceHello {
+		defer a.attachWorkspaceLink()()
 	}
 	a.serveAuthorized(conn, fp, hello.Name, auth.Capabilities, check, audit)
 }
@@ -624,10 +672,13 @@ func (a *Agent) mustIdentify(helloKind, fp, label string) bool {
 	return a.unlabeledPairing(fp, label)
 }
 
-func (a *Agent) authorize(fp, name, label string, scopes ...sessionAudit) bool {
+// authorize reports whether fp may use this device, asking the owner when it
+// is not yet trusted. The error is set only when the request could not even be
+// put to the owner (console.ErrTooManyPairings).
+func (a *Agent) authorize(fp, name, label string, scopes ...sessionAudit) (bool, error) {
 	if a.known.Has(fp) {
 		a.known.Touch(fp)
-		return true
+		return true, nil
 	}
 	if a.opts.AutoYes {
 		a.known.AddLabeled(fp, name, label)
@@ -638,25 +689,26 @@ func (a *Agent) authorize(fp, name, label string, scopes ...sessionAudit) bool {
 		// instead of a stdout line nobody reads.
 		a.logSessionEvent(firstAudit(scopes), eventlog.Event{Type: "trust", PeerFP: fp, PeerName: name, Detail: label, Decision: "auto-trust"})
 		a.notifyTrustChanged(fp, name, "granted")
-		return true
+		return true, nil
 	}
 	// Surface the pairing request to a connected front-end (the portal web
 	// console) and block for a human's trust decision. A headless agent with no
 	// portal connected denies (pre-trust with --portal-fps or --yes instead).
 	var paired bool
+	var err error
 	if firstAudit(scopes).grantID != "" {
-		paired = a.console.AskPairNonBlocking(fp, name, label)
+		paired, err = a.console.AskPairNonBlocking(fp, name, label)
 	} else {
-		paired = a.console.AskPair(fp, name, label)
+		paired, err = a.console.AskPair(fp, name, label)
 	}
 	if paired {
 		a.known.AddLabeled(fp, name, label)
 		fmt.Printf("[paired] controller %q trusted via console: %s\n", name, fp)
 		a.logSessionEvent(firstAudit(scopes), eventlog.Event{Type: "trust", PeerFP: fp, PeerName: name, Detail: label, Decision: "console"})
 		a.notifyTrustChanged(fp, name, "granted")
-		return true
+		return true, nil
 	}
-	return false
+	return false, err
 }
 
 // pairingURL builds the portal URL a user clicks to trust this controller. The
@@ -764,6 +816,8 @@ func (a *Agent) serveAuthorized(conn *tls.Conn, fp, peerName string, caps sessio
 			continue
 		}
 		switch m.Kind {
+		case protocol.KindDesktop:
+			pending = a.doDesktop(conn, fp, peerName, m, audit, check)
 		case protocol.KindExec:
 			pending = a.doExecAuthorized(conn, fp, peerName, m, audit, check)
 		case protocol.KindCancel:
@@ -772,7 +826,7 @@ func (a *Agent) serveAuthorized(conn *tls.Conn, fp, peerName string, caps sessio
 		case protocol.KindExecAsync:
 			a.doExecAsync(conn, fp, peerName, m)
 		case protocol.KindExecPoll:
-			a.doExecPoll(conn, m)
+			a.doExecPoll(conn, fp, peerName, m, audit)
 		case protocol.KindLogs:
 			ok, decision := a.gateDataCapability(capabilityReadEventLog, fp, check)
 			if ok && !checksPass([]func() bool{check, audit.workspaceCheck}) {
@@ -872,7 +926,7 @@ func (a *Agent) status() protocol.Message {
 
 func requiredCapability(kind string) sessionauth.Capabilities {
 	switch kind {
-	case protocol.KindExec, protocol.KindExecAsync, protocol.KindExecPoll:
+	case protocol.KindExec, protocol.KindExecAsync, protocol.KindExecPoll, protocol.KindDesktop:
 		return sessionauth.Exec
 	case protocol.KindFileGet, protocol.KindFileRead:
 		return sessionauth.Read
@@ -952,9 +1006,16 @@ func (a *Agent) doExecAuthorized(conn *tls.Conn, fp, peerName string, m protocol
 	// and no file.
 	spill := server.NewSpill(server.FrameWriter(conn, protocol.FrameStdout), m.SpillAfter)
 	out := io.Writer(spill)
+	var permissionOutput *androidPermissionWriter
+	if runtime.GOOS == "android" && !m.Elevate {
+		permissionOutput = &androidPermissionWriter{out: out, command: m.Command}
+		out = permissionOutput
+	}
 	var code int
 	var err error
 	var ranVia elevate.Kind
+	var desktopSession *uint32
+	ctx = desktop.WithSessionObserver(ctx, func(id uint32) { desktopSession = &id })
 	switch {
 	case m.Elevate:
 		// A desktop capture is the same verb through the same gate, with no
@@ -1009,6 +1070,9 @@ func (a *Agent) doExecAuthorized(conn *tls.Conn, fp, peerName string, m protocol
 			}
 		}
 	}
+	if permissionOutput != nil && permissionOutput.denied && (code != 0 || err != nil) && ctx.Err() == nil {
+		err = errors.New(androidPermissionHint)
+	}
 	if err != nil {
 		if ctx.Err() != nil && !errors.Is(err, server.ErrSessionCancelled) {
 			// Say who ended it: the audit line and a controller that is still
@@ -1017,7 +1081,7 @@ func (a *Agent) doExecAuthorized(conn *tls.Conn, fp, peerName string, m protocol
 			// failed, so it is passed through untouched.
 			err = fmt.Errorf("command cancelled by the controller")
 		}
-		a.logSessionEvent(audit, eventlog.Event{Type: "exec", PeerFP: fp, PeerName: peerName, Detail: m.Command, Cwd: m.Cwd, Decision: decision, Via: string(ranVia)})
+		a.logSessionEvent(audit, eventlog.Event{Type: "exec", PeerFP: fp, PeerName: peerName, Detail: m.Command, Cwd: m.Cwd, Decision: decision, Via: string(ranVia), DesktopSession: desktopSession})
 		if code == 0 {
 			code = -1
 		}
@@ -1032,7 +1096,7 @@ func (a *Agent) doExecAuthorized(conn *tls.Conn, fp, peerName string, m protocol
 		})
 		return pending
 	}
-	a.logSessionEvent(audit, eventlog.Event{Type: "exec", PeerFP: fp, PeerName: peerName, Detail: m.Command, Cwd: m.Cwd, Decision: decision, Exit: &code, Via: string(ranVia)})
+	a.logSessionEvent(audit, eventlog.Event{Type: "exec", PeerFP: fp, PeerName: peerName, Detail: m.Command, Cwd: m.Cwd, Decision: decision, Exit: &code, Via: string(ranVia), DesktopSession: desktopSession})
 	a.notifyExecFinished(m.Command, m.Cwd, peerName, code)
 	spillPath, spilled, kept := spill.Close()
 	protocol.WriteMessage(conn, protocol.Message{
@@ -1055,7 +1119,7 @@ func (a *Agent) doExecAsync(conn *tls.Conn, fp, peerName string, m protocol.Mess
 		protocol.WriteMessage(conn, protocol.Message{Kind: protocol.KindReject, Reason: "command denied by device policy: " + m.Command})
 		return
 	}
-	id, err := a.jobs.start(a.opts.Shell, m.Command, m.Cwd)
+	id, err := a.jobs.start(fp, a.opts.Shell, m.Command, m.Cwd)
 	if err != nil {
 		protocol.WriteMessage(conn, protocol.Message{Kind: protocol.KindError, Reason: err.Error()})
 		return
@@ -1065,12 +1129,19 @@ func (a *Agent) doExecAsync(conn *tls.Conn, fp, peerName string, m protocol.Mess
 }
 
 // doExecPoll streams a background job's output past m.Offset, then reports the
-// new total length and whether it is still running. The job id (a random secret
-// returned at start) is the capability, so no extra policy gate is applied — the
-// command itself was gated when it started.
-func (a *Agent) doExecPoll(conn *tls.Conn, m protocol.Message) {
-	j := a.jobs.get(m.JobID)
+// new total length and whether it is still running. No policy gate applies —
+// the command itself was gated when it started — but the job is only visible
+// to the controller that started it. The ID alone cannot be the authority: it
+// is written to the activity log, and everyone the device is shared with can
+// read that log.
+func (a *Agent) doExecPoll(conn *tls.Conn, fp, peerName string, m protocol.Message, audit sessionAudit) {
+	j := a.jobs.getFor(m.JobID, fp)
 	if j == nil {
+		if a.jobs.get(m.JobID) != nil {
+			// Someone else's job. Answered like a missing one; recorded,
+			// because asking for another controller's output is worth knowing.
+			a.logSessionEvent(audit, eventlog.Event{Type: "exec", PeerFP: fp, PeerName: peerName, Detail: "[poll " + m.JobID + "]", Decision: "denied: job belongs to another controller"})
+		}
 		protocol.WriteMessage(conn, protocol.Message{Kind: protocol.KindError, Reason: "unknown or expired job: " + m.JobID})
 		return
 	}
@@ -1177,9 +1248,6 @@ func (a *Agent) runHTTP(ctx context.Context) error {
 			if ctx.Err() != nil {
 				a.deregisterHTTP(base)
 				return nil
-			}
-			if strings.Contains(err.Error(), "401") {
-				return fmt.Errorf("relay rejected token")
 			}
 			failures++
 			report("relay poll failed: %v", err)
@@ -1297,6 +1365,16 @@ func (a *Agent) handleConsoleRPC(msg protocol.Message) protocol.Message {
 			return protocol.Message{Kind: protocol.KindError, Reason: "invalid pairing port or six-digit code"}
 		}
 		_, _, err := a.runADBPair(fmt.Sprintf("adb-pair %d %s", msg.PairPort, msg.PairCode), io.Discard)
+		// Pairing puts this agent's key into the device's adbd trust list,
+		// which is worth a line in the activity log like any adb-pair run
+		// through exec — with the outcome, never with the code.
+		if a.log != nil {
+			exit := 0
+			if err != nil {
+				exit = -1
+			}
+			a.log.Append(eventlog.Event{Type: "exec", Detail: fmt.Sprintf("adb-pair %d [redacted]", msg.PairPort), Decision: "console", Exit: &exit})
+		}
 		if err != nil {
 			return protocol.Message{Kind: protocol.KindError, Reason: strings.ReplaceAll(err.Error(), msg.PairCode, "[redacted]")}
 		}
@@ -1304,6 +1382,7 @@ func (a *Agent) handleConsoleRPC(msg protocol.Message) protocol.Message {
 
 	case protocol.KindConsoleState:
 		snap := a.console.State()
+		snap.ADB = a.adbLink()
 		data, _ := json.Marshal(snap)
 		return protocol.Message{Kind: protocol.KindConsoleState, Data: json.RawMessage(data)}
 
@@ -1403,6 +1482,12 @@ func (a *Agent) handleConsoleRPC(msg protocol.Message) protocol.Message {
 		data, _ := json.Marshal(events)
 		return protocol.Message{Kind: protocol.KindLogs, Data: json.RawMessage(data)}
 
+	case protocol.KindApprovalPush:
+		return a.approvalPush(msg.Data)
+
+	case protocol.KindGrantOnce:
+		return a.grantOnce(msg)
+
 	default:
 		return protocol.Message{Kind: protocol.KindError, Data: json.RawMessage(`"unknown RPC kind"`)}
 	}
@@ -1439,9 +1524,6 @@ func (a *Agent) serveConsole(ctx context.Context, conn net.Conn) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	a.consoles.Add(1)
-	defer a.consoles.Add(-1)
-
 	var wmu sync.Mutex
 	send := func(m protocol.Message) error {
 		wmu.Lock()
@@ -1453,6 +1535,13 @@ func (a *Agent) serveConsole(ctx context.Context, conn net.Conn) {
 	ch, unsub := a.console.Subscribe()
 	defer unsub()
 	a.spawn(func() { pumpApprovalNotifs(ctx, ch, a.console, send) })
+
+	// On an approval phone this session also carries the owner's decisions
+	// back to the portal, starting with any it has not settled yet.
+	if a.phone != nil {
+		detach := a.phone.attach(send)
+		defer detach()
+	}
 
 	// Speak the same framed protocol the controller/portal uses (the hello/OK
 	// handshake in handleSession was framed too) — NOT raw json.Encoder.
@@ -1487,10 +1576,7 @@ func (a *Agent) runConsolePrompt(ctx context.Context) {
 		}
 		snap := a.console.State()
 		for _, p := range snap.Pending {
-			fmt.Printf("\n--- approval request ---\n")
-			fmt.Printf("ID:  %s\n", p.ID)
-			fmt.Printf("Cmd: %s\n", p.Cmd)
-			fmt.Printf("Allow? [y] once  [a] remember dir  [g] remember global  [n] deny: ")
+			fmt.Print(approvalPrompt(p))
 			var line string
 			fmt.Scanln(&line)
 			// console.Decide speaks the y/a/g/n vocabulary directly; anything
@@ -1504,10 +1590,42 @@ func (a *Agent) runConsolePrompt(ctx context.Context) {
 	}
 }
 
+// approvalPrompt is what the device's own terminal shows for a pending request.
+// The command is the controller's text, and a terminal would act on control
+// characters in it — enough to show one command while the owner approves
+// another — so they are made visible.
+func approvalPrompt(p console.Pending) string {
+	return "\n--- approval request ---\n" +
+		"ID:  " + p.ID + "\n" +
+		"Cmd: " + termsafe.Escape(p.Cmd) + "\n" +
+		"Allow? [y] once  [a] remember dir  [g] remember global  [n] deny: "
+}
+
+// peerText is a controller's self-description with control characters
+// removed: line breaks and tabs become spaces, everything else is dropped, and
+// so is anything that is not UTF-8.
+func peerText(s string) string {
+	s = strings.ToValidUTF8(s, "")
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return ' '
+		case unicode.IsControl(r):
+			return -1
+		}
+		return r
+	}, s))
+}
+
 // Busy reports whether this agent is in the middle of work that restarting it
-// would destroy: an open shell session (its cwd, its environment, its history),
-// a background job whose output nobody has collected yet, or a live console
-// session. It is the gate the auto-updater consults before swapping the binary
+// would destroy: a command running in a shell session, a background job whose
+// output nobody has collected yet, or a request waiting on the owner's answer.
+//
+// An idle shell is not work. Sessions are never reaped, so counting every open
+// one made a single plain exec block self-update for the rest of the agent's
+// life, silently (5090 stayed on v0.17.0 through four releases, found 10-02).
+// A restart costs an idle session its cwd; the controller's next exec opens a
+// fresh one. It is the gate the auto-updater consults before swapping the binary
 // under itself.
 //
 // A relay it cannot currently reach is deliberately not busy. That state can
@@ -1515,12 +1633,15 @@ func (a *Agent) runConsolePrompt(ctx context.Context) {
 // the devices most in need of an unattended update are the ones that never get
 // one.
 func (a *Agent) Busy() bool {
+	if a.desktop.Busy() {
+		return true
+	}
 	if a.workspacesBusy() {
 		return true
 	}
 	a.sessMu.Lock()
 	for _, sess := range a.sessions {
-		if !sess.Closed() {
+		if !sess.Closed() && sess.Running() {
 			a.sessMu.Unlock()
 			return true
 		}
@@ -1530,7 +1651,23 @@ func (a *Agent) Busy() bool {
 	if a.jobs != nil && a.jobs.runningCount() > 0 {
 		return true
 	}
-	return a.consoles.Load() > 0
+	return a.awaitingOwner()
+}
+
+// awaitingOwner reports whether an approval or a pairing request is waiting on
+// the owner. Restarting then would drop the request and the connection they
+// are answering it on.
+//
+// An open console is not by itself such a wait. The portal's approval watch
+// keeps one open on every device it watches, around the clock (ADR 0015), and
+// counting the connection kept those devices from ever updating (S19,
+// 2026-10-02). The watch dials again after the restart.
+func (a *Agent) awaitingOwner() bool {
+	if a.console == nil {
+		return false
+	}
+	st := a.console.State()
+	return len(st.Pending) > 0 || len(st.PendingPairings) > 0
 }
 
 // isPowerShell reports whether the resolved session shell is a PowerShell.

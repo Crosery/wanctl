@@ -120,7 +120,13 @@ func Entry(c Command) string {
 	if params := c.CLIParams(); len(params) > 0 {
 		b.WriteString("\nPARAMETERS\n")
 		for _, p := range params {
-			b.WriteString(fmt.Sprintf("  %-28s %s\n", p.CLISpelling(), kind(p)))
+			line := fmt.Sprintf("  %-28s %s", p.CLISpelling(), kind(p))
+			if len([]rune(line)) > Width {
+				b.WriteString("  " + p.CLISpelling() + "\n")
+				b.WriteString(wrap(kind(p), Width-6, "      ") + "\n")
+			} else {
+				b.WriteString(line + "\n")
+			}
 			b.WriteString(wrap(p.CLIMeaning(), Width-6, "      ") + "\n")
 		}
 	}
@@ -231,7 +237,10 @@ func Markdown() string {
 	b.WriteString("## Instructions\n\n")
 	b.WriteString("This is what an MCP host is handed before it calls anything — the\n")
 	b.WriteString("`instructions` field of the initialize response, and the output of\n")
-	b.WriteString("`wanctl help --instructions`. It is the harness's system prompt.\n\n")
+	b.WriteString("`wanctl help --instructions`. It is the harness's system prompt.\n")
+	b.WriteString("The hosted endpoint (`/mcp` on a relay) hands out the same text without\n")
+	b.WriteString("`wanctl_login` and the `LOGIN REQUIRED` line: every request there carries\n")
+	b.WriteString("an OAuth bearer, which is the login.\n\n")
 	b.WriteString("```\n" + Instructions() + "```\n\n")
 
 	b.WriteString("## Commands\n\n")

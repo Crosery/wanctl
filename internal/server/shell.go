@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf16"
 
 	"wanctl/internal/protocol"
 )
@@ -126,6 +127,11 @@ type ShellSession struct {
 	// the lock that guards every session on the device. Reading it must never
 	// wait for the command running in this one.
 	closed atomic.Bool
+	// inUse counts commands running or queued on this session. The agent's
+	// update gate asks it: an idle shell loses only its cwd to a restart, and
+	// counting every open shell as work kept an agent that had run one exec
+	// from ever updating again.
+	inUse atomic.Int32
 
 	// container holds the shell and everything it starts, so cancelling a
 	// command is one kernel operation on a named unit rather than a guess at
@@ -162,15 +168,18 @@ func (s *ShellSession) endOutput(cause error) {
 }
 
 // cancelNow is what a cancellation does: end the session's processes and stop
-// waiting on their output. The two are separate steps on purpose. Killing the
-// container does not guarantee the output pipe closes, because a descendant
-// that escaped the container still holds it, so the reader is cut here rather
-// than left to a copier that may never see EOF. That is also what makes a kill
-// that *failed* reach the caller immediately instead of when the command it
-// could not stop happens to end.
+// waiting on them. The two are separate steps on purpose. Killing the container
+// does not guarantee either pipe closes, because a descendant that escaped the
+// container still holds both, and a kill can fail outright. So both waits are
+// cut here: the reader, which a copier that never sees EOF would otherwise feed
+// forever, and stdin, where a command larger than the pipe sits blocked in
+// writeCommand behind a shell that has stopped reading (#112). That is also what
+// makes a kill that *failed* reach the caller immediately instead of when the
+// command it could not stop happens to end.
 func (s *ShellSession) cancelNow() error {
 	s.closed.Store(true)
 	err := s.killContainer()
+	s.stdin.Close()
 	s.endOutput(ErrSessionCancelled)
 	return err
 }
@@ -246,11 +255,15 @@ func NewShellSessionInDir(shell, cwd string) (*ShellSession, error) {
 		return abandon(err)
 	}
 	go func() {
+		// Wait for the shell alone, not cmd.Wait: that also waits for the
+		// output copiers, up to WaitDelay after the shell is gone when an
+		// escaped descendant holds stdout (#110). Reaping releases the shell's
+		// pid, and with it the process-group id that is the same number, so the
+		// container's one kill is spent now: it ends whatever the shell left in
+		// its group (#111), and nothing can signal that number later.
+		cmd.Process.Wait()
+		container.Kill()
 		cmd.Wait()
-		// Reaping releases the shell's pid, and with it the process-group id
-		// that is the same number. The container must stop using it at exactly
-		// this point, before anything can be given that number again.
-		container.reap()
 		pw.Close()
 	}()
 
@@ -291,24 +304,50 @@ func (s *ShellSession) markerPrefix() string { return "<<<WANCTL_END:" }
 // writeCommand sends the user command followed by the sentinel echo.
 func (s *ShellSession) writeCommand(command string) error {
 	var b strings.Builder
-	b.WriteString(command)
-	b.WriteString("\n")
 	if runtime.GOOS == "windows" {
-		// $LASTEXITCODE is only set by native executables; fall back to $? for
-		// cmdlet success/failure.
+		b.WriteString(winSessionCommand(command))
+		b.WriteString("\n")
+		// $LASTEXITCODE is only set by native executables; fall back to the
+		// command's own $? for cmdlet success/failure.
 		b.WriteString(fmt.Sprintf(
-			"\"%s$(if($null -ne $LASTEXITCODE){$LASTEXITCODE}else{[int](-not $?)}):%s>>>\"\n",
+			"\"%s$(if($null -ne $LASTEXITCODE){$LASTEXITCODE}else{[int](-not $wanctlOk)}):%s>>>\"\n",
 			s.markerPrefix(), s.token))
 	} else {
+		b.WriteString(command)
+		b.WriteString("\n")
 		b.WriteString(fmt.Sprintf("printf '\\n%s%%s:%s>>>\\n' \"$?\"\n", s.markerPrefix(), s.token))
 	}
 	_, err := io.WriteString(s.stdin, b.String())
 	return err
 }
 
+// winSessionCommand is what a Windows session is sent to run command: the
+// command spelled in printable ASCII, because PowerShell cannot be told how to
+// decode its stdin.
+//
+// `powershell -Command -` reads stdin through a decoder for the console's input
+// code page — the OEM one, 437 or 936, never UTF-8 — and builds it before the
+// first line arrives. Setting [Console]::InputEncoding from inside the session
+// changes what that property reports and nothing else (PowerShell 5.1,
+// measured 2026-10-13), so the UTF-8 bytes of `echo 中文` ran as
+// `echo Σ╕¡µûç`. Printable ASCII reads the same in every code page; anything
+// else goes as [char] code units, which ConstrainedLanguage mode still allows
+// where a base64 decode through [Convert] and [Text.Encoding] is refused.
+//
+// Invoke-Expression runs the text in the session's scope, so cd and variables
+// persist as before, and parses it as one unit, as -oneshot does. Its own $?
+// stays true when a cmdlet inside it fails, so the command records its last
+// statement's $? in $wanctlOk for the end marker. The reset on the line before
+// covers a command that never gets that far.
+func winSessionCommand(command string) string {
+	return "$wanctlOk=$false\nInvoke-Expression (" + powerShellASCIIString(command+"\n$wanctlOk=$?") + ")"
+}
+
 // Exec runs command in the session's current directory, streaming output to
 // out, and returns the exit code.
 func (s *ShellSession) Exec(command string, out io.Writer) (int, error) {
+	s.inUse.Add(1)
+	defer s.inUse.Add(-1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.execLocked(command, out)
@@ -337,6 +376,8 @@ func (s *ShellSession) ExecInDir(command, cwd string, out io.Writer) (int, error
 // failed". A kill that failed is reported as such and never swallowed, because
 // the caller would otherwise be told the command stopped when it did not.
 func (s *ShellSession) ExecInDirContext(ctx context.Context, command, cwd string, out io.Writer) (int, error) {
+	s.inUse.Add(1)
+	defer s.inUse.Add(-1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// A request that was already cancelled — the controller left while it sat
@@ -422,10 +463,73 @@ func (s *ShellSession) changeDirLocked(cwd string, out io.Writer) (int, error) {
 	return s.execLocked(changeDirCommand(runtime.GOOS, path), out)
 }
 
+// CurrentDir reports the directory the session's shell is in now, as the shell
+// itself names it: the logical path its own pwd prints, so a session started in
+// or moved to a directory reports that same spelling back.
+//
+// The answer travels through a data file this process created, the same way a
+// cwd travels in (changeDirLocked), and never through the session's output
+// stream: a background job an earlier command started may still be writing to
+// that stream at any moment. A shell that cannot name its directory — the
+// directory was removed, the location is not a filesystem path — is an error,
+// never a guess.
+//
+// This is the shell's own account of itself. A command that was allowed to run
+// in the session can redefine what the shell does next, and this is no
+// exception; what it gets right is the ordinary case of a command having moved
+// the shell with cd.
+func (s *ShellSession) CurrentDir(ctx context.Context) (string, error) {
+	f, err := os.CreateTemp("", "wanctl-pwd-"+s.token+"-*")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+	code, err := s.ExecInDirContext(ctx, currentDirCommand(runtime.GOOS, path), "", io.Discard)
+	if err != nil {
+		return "", err
+	}
+	// Only the POSIX status belongs to this command. PowerShell's end marker
+	// reports $LASTEXITCODE, which still holds whatever native program an
+	// earlier command ran; there an empty file is the failure signal.
+	if code != 0 && runtime.GOOS != "windows" {
+		return "", fmt.Errorf("session shell could not name its directory (exit %d)", code)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	dir := string(b)
+	if runtime.GOOS != "windows" {
+		dir = strings.TrimSuffix(dir, "\n") // pwd's own terminator; a name may end in one too
+	}
+	if dir == "" {
+		return "", fmt.Errorf("session shell could not name its directory")
+	}
+	return dir, nil
+}
+
+// currentDirCommand is fixed protocol source that writes the shell's directory
+// into a data file generated locally. `command` keeps a shell function named
+// pwd out of it; PowerShell reads the location from the engine rather than
+// from Get-Location, which a script could redefine, and writes nothing when
+// the location is not on the filesystem.
+func currentDirCommand(goos, dataPath string) string {
+	if goos == "windows" {
+		return "$wanctlLoc=$ExecutionContext.SessionState.Path.CurrentLocation; if($wanctlLoc.Provider.Name -eq 'FileSystem'){[IO.File]::WriteAllText(" + quotePowerShellLiteral(dataPath) + ",$wanctlLoc.ProviderPath)}"
+	}
+	return "command pwd >| " + quotePOSIXLiteral(dataPath)
+}
+
 // Closed reports whether the session has been torn down. It takes no lock: the
 // agent asks this while holding the lock that guards every session on the
 // device, so waiting here for one session's command would stall all of them.
 func (s *ShellSession) Closed() bool { return s.closed.Load() }
+
+// Running reports whether a command is running or waiting on this session.
+// Like Closed it takes no lock.
+func (s *ShellSession) Running() bool { return s.inUse.Load() > 0 }
 
 // Close terminates the session: the shell and everything still running inside
 // its container. Killing only the shell would leave its children orphaned and
@@ -500,6 +604,40 @@ func quotePOSIXLiteral(value string) string {
 
 func quotePowerShellLiteral(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+// powerShellASCIIString renders s as a PowerShell expression that evaluates to
+// s and contains only printable ASCII: runs of it as single-quoted literals,
+// every other UTF-16 code unit as [char]N. The list starts with an empty
+// literal so that -join has a string to return even when s is empty.
+func powerShellASCIIString(s string) string {
+	var b strings.Builder
+	b.WriteString("-join (''")
+	literal := false
+	for _, u := range utf16.Encode([]rune(s)) {
+		if u >= 0x20 && u < 0x7f {
+			if !literal {
+				b.WriteString(",'")
+				literal = true
+			}
+			if u == '\'' {
+				b.WriteByte('\'')
+			}
+			b.WriteByte(byte(u))
+			continue
+		}
+		if literal {
+			b.WriteByte('\'')
+			literal = false
+		}
+		b.WriteString(",[char]")
+		b.WriteString(strconv.Itoa(int(u)))
+	}
+	if literal {
+		b.WriteByte('\'')
+	}
+	b.WriteByte(')')
+	return b.String()
 }
 
 // FrameWriter adapts a writer into framed output of a fixed type, so command

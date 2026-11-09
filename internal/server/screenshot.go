@@ -4,12 +4,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"wanctl/internal/desktop"
+	"wanctl/internal/protocol"
 )
 
 // This file gives the `screenshot` verb a body on the three desktop platforms.
@@ -63,6 +68,57 @@ func RunScreenshot(ctx context.Context, command string, out io.Writer) (handled 
 
 // captureScreen returns the PNG bytes of the whole desktop.
 func captureScreen(ctx context.Context) ([]byte, error) {
+	return captureScreenUsing(ctx, desktop.SessionZero, desktop.RunHelper, func(ctx context.Context) ([]byte, error) {
+		return captureScreenChecked(ctx, desktop.CheckCaptureSession, captureScreenLocal)
+	})
+}
+
+func captureScreenChecked(ctx context.Context, check func() error, capture func(context.Context) ([]byte, error)) ([]byte, error) {
+	if err := check(); err != nil {
+		return nil, err
+	}
+	data, err := capture(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := check(); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func captureScreenUsing(ctx context.Context, sessionZero func() (bool, error), run desktop.Runner, local func(context.Context) ([]byte, error)) ([]byte, error) {
+	zero, err := sessionZero()
+	if err != nil {
+		return nil, err
+	}
+	if !zero {
+		return local(ctx)
+	}
+	res, data, err := run(ctx, desktop.Job{Action: "screenshot", Request: protocol.DesktopRequest{}})
+	if err != nil {
+		return nil, fmt.Errorf("desktop screenshot helper failed")
+	}
+	if res.Status != "completed" {
+		if res.Error == desktop.ErrLocked.Error() {
+			return nil, desktop.ErrLocked
+		}
+		return nil, fmt.Errorf("desktop screenshot: %s", res.Error)
+	}
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("desktop screenshot helper returned an invalid image")
+	}
+	// Old exec clients expect raw PNG. Only this boundary transcodes; desktop
+	// clients retain the helper's original JPEG and coordinate metadata.
+	var out bytes.Buffer
+	if err := png.Encode(&out, img); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func captureScreenLocal(ctx context.Context) ([]byte, error) {
 	f, err := os.CreateTemp("", "wanctl-screenshot-*.png")
 	if err != nil {
 		return nil, err
@@ -178,8 +234,21 @@ func captureFailure(tool, msg string) error {
 // windowsCapture is the PowerShell that blits the virtual screen — every
 // monitor, in their desktop arrangement — into one PNG. It uses only what ships
 // with Windows, so nothing has to be installed on the device first.
+//
+// The process declares itself DPI aware before it asks how big the screen is.
+// powershell.exe ships without that declaration, so on a display scaled to 125%
+// Windows reports the virtual screen in logical pixels — 1536x864 for a
+// 1920x1080 panel — and the blit copies only the top-left 80% of it. Per-monitor
+// v2 (context handle -4, Windows 10 1703 and later) gives physical pixels on every monitor, however
+// each one is scaled; an older system falls back to system awareness, which is
+// right whenever all monitors share one scale.
 func windowsCapture(path string) string {
-	return "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; " +
+	return "Add-Type -Namespace Wanctl -Name Dpi -MemberDefinition '" +
+		"[DllImport(\"user32.dll\")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value); " +
+		"[DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();'; " +
+		"try { $aware = [Wanctl.Dpi]::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch { $aware = $false }; " +
+		"if (-not $aware) { [void][Wanctl.Dpi]::SetProcessDPIAware() }; " +
+		"Add-Type -AssemblyName System.Windows.Forms,System.Drawing; " +
 		"$b = [System.Windows.Forms.SystemInformation]::VirtualScreen; " +
 		"$bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); " +
 		"$g = [System.Drawing.Graphics]::FromImage($bmp); " +

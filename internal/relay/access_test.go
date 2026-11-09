@@ -25,6 +25,9 @@ type accessAdmin struct {
 	admins  []string
 	nextID  int
 	now     time.Time
+	// contacts stands in for the confirmed contact addresses the PG store
+	// reads into AccessRequest.Email, keyed "provider/subject".
+	contacts map[string]string
 }
 
 func (a *accessAdmin) at() time.Time {
@@ -51,7 +54,7 @@ func (a *accessAdmin) CreateAccessRequest(provider, subject, login, note string)
 	a.nextID++
 	row := AccessRequest{
 		ID: a.nextID, Provider: provider, Subject: subject, Login: login,
-		Note: note, Status: accessPending, CreatedAt: a.at(),
+		Email: a.contacts[provider+"/"+subject], Note: note, Status: accessPending, CreatedAt: a.at(),
 	}
 	a.rows = append(a.rows, row)
 	return row, nil
@@ -303,4 +306,42 @@ type accessEventSender struct{ events chan notify.Event }
 func (s *accessEventSender) Send(_ context.Context, _ notify.Destination, event notify.Event) (notify.Result, error) {
 	s.events <- event
 	return notify.Result{HTTPStatus: 200, Attempts: 1, Event: event.Event}, nil
+}
+
+// An application no longer carries an address: the relay ignores one sent
+// in the body, and the address the queue and the status show is the
+// applicant's confirmed contact address.
+func TestAccessRequestEmailComesFromContact(t *testing.T) {
+	admin := &accessAdmin{contacts: map[string]string{"github/8437": "person@example.com"}}
+	r := accessRelay(t, admin)
+	rr := accessDo(t, r, "POST", "/admin/access-requests",
+		`{"provider":"github","subject":"8437","login":"octocat","email":"typed@example.com"}`, "s3cret")
+	if rr.Code != 200 || len(admin.rows) != 1 || admin.rows[0].Email != "person@example.com" {
+		t.Fatalf("create = %d %s; rows = %#v", rr.Code, rr.Body.String(), admin.rows)
+	}
+	rr = accessDo(t, r, "GET", "/admin/access-requests/status?provider=github&subject=8437", "", "s3cret")
+	var status map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &status)
+	if _, ok := status["email"]; ok {
+		t.Fatalf("status leaked email: %s", rr.Body.String())
+	}
+	if status["email_hint"] != maskEmail("person@example.com") {
+		t.Fatalf("status email_hint = %v", status["email_hint"])
+	}
+}
+
+func TestMaskEmail(t *testing.T) {
+	for in, want := range map[string]string{
+		"renjinxi@qq.com": "r•••@qq.com",
+		"a@b.co":          "a•••@b.co",
+		"été@example.fr":  "é•••@example.fr",
+		"":                "",
+		"no-at-sign":      "",
+		"@example.com":    "",
+		"trailing@":       "",
+	} {
+		if got := maskEmail(in); got != want {
+			t.Errorf("maskEmail(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

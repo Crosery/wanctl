@@ -53,6 +53,7 @@ type workspaceJob struct {
 	code           int
 	err            string
 	done           bool
+	dirAfter       string // where the shell stood once the command finished
 }
 
 func validWorkspaceID(id string) bool {
@@ -179,6 +180,7 @@ func (w *workspace) snapshot(id string, offset int64) (*protocol.WorkspaceResult
 	}
 	r.RequestID, r.Done, r.Code, r.Error = id, j.done, j.code, j.err
 	r.RequestState = j.state
+	r.Cwd = j.dirAfter
 	r.Output, r.NextOffset, r.OutputBytes = string(j.output[offset:end]), end, j.total
 	r.RetainedBytes = int64(len(j.output))
 	r.Truncated = j.total > int64(len(j.output))
@@ -284,7 +286,7 @@ func (a *Agent) startWorkspaceCommand(w *workspace, fp, peer string, m protocol.
 	if err != nil || !fresh {
 		return err
 	}
-	cwd := w.root
+	var cwd string
 	if m.Cwd != "" {
 		cwd, err = w.resolve(m.Cwd)
 		if err != nil {
@@ -293,6 +295,14 @@ func (a *Agent) startWorkspaceCommand(w *workspace, fp, peer string, m protocol.
 			w.mu.Unlock()
 			return err
 		}
+	} else {
+		// Without a cwd the command runs wherever the shell is now, and an
+		// earlier command may have moved it away from the root. The policy
+		// decision, the approval card and the audit line have to name that
+		// directory: a directory-scoped rule is a statement about where a
+		// command runs. The shell cannot move before this command starts —
+		// this request is the workspace's active one until it finishes.
+		cwd = w.currentDir()
 	}
 	stillPending := func() bool {
 		w.mu.Lock()
@@ -325,12 +335,38 @@ func (a *Agent) startWorkspaceCommand(w *workspace, fp, peer string, m protocol.
 			changeDir = cwd
 		}
 		code, runErr := w.shell.ExecInDirContext(ctx, source, changeDir, workspaceWriter{w, m.RequestID})
+		// Reported with the result so a caller that shows the directory, as
+		// `wanctl shell` does in its prompt, needs no second command for it.
+		// Asked before the job counts as finished: the shell cannot move in
+		// between, because this request is still the workspace's active one.
+		dirAfter := ""
+		if runErr == nil {
+			dirAfter = w.currentDir()
+		}
 		w.mu.Lock()
+		w.jobs[m.RequestID].dirAfter = dirAfter
 		w.finishLocked(m.RequestID, code, runErr)
 		w.mu.Unlock()
 		a.logSessionEvent(audit, eventlog.Event{Type: "exec", PeerFP: fp, PeerName: peer, Detail: "[workspace " + w.id + " request " + m.RequestID + "] " + m.Command, Cwd: cwd, Decision: "finished", Exit: &code})
 	}()
 	return nil
+}
+
+// workspaceDirTimeout bounds asking the shell where it is. A shell that cannot
+// print its directory in this long is not going to run the command either.
+const workspaceDirTimeout = 10 * time.Second
+
+// currentDir is the directory the workspace shell is in, or "" when the shell
+// cannot say. "" is the safe unknown: no directory-scoped rule matches it, so
+// the command needs a global rule, bypass mode or a human's approval.
+func (w *workspace) currentDir() string {
+	ctx, cancel := context.WithTimeout(w.ctx, workspaceDirTimeout)
+	defer cancel()
+	dir, err := w.shell.CurrentDir(ctx)
+	if err != nil {
+		return ""
+	}
+	return dir
 }
 
 // Scripts must execute in the existing shell to preserve cd/export. Keep the
@@ -408,10 +444,43 @@ func (a *Agent) closeWorkspaces() {
 	}
 }
 
+// workspacesBusy reports whether restarting would cut off workspace work: a
+// command waiting for approval or running in a workspace shell, or a
+// controller connected over a reusable workspace link.
+//
+// An idle workspace is not work. Nothing reaps workspaces, so counting every
+// open one kept a device that had used `wanctl workspace` off every later
+// release (found 2026-10-02). A restart costs an idle workspace its shell state; the
+// controller's next request is told the workspace is unknown and opens a new
+// one.
 func (a *Agent) workspacesBusy() bool {
 	a.workspaceMu.Lock()
 	defer a.workspaceMu.Unlock()
-	return len(a.workspaces) > 0
+	if a.workspaceLinks > 0 {
+		return true
+	}
+	for _, w := range a.workspaces {
+		w.mu.Lock()
+		active := w.active != ""
+		w.mu.Unlock()
+		if active {
+			return true
+		}
+	}
+	return false
+}
+
+// attachWorkspaceLink counts a reusable workspace connection for as long as it
+// is served; call the returned func when it ends.
+func (a *Agent) attachWorkspaceLink() (detach func()) {
+	a.workspaceMu.Lock()
+	a.workspaceLinks++
+	a.workspaceMu.Unlock()
+	return func() {
+		a.workspaceMu.Lock()
+		a.workspaceLinks--
+		a.workspaceMu.Unlock()
+	}
 }
 
 // handleWorkspace either handles a control/exec request, or unwraps a file

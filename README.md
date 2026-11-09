@@ -93,7 +93,7 @@ sessions remain opaque; see the [adapter trust boundary](docs/webfetch.md).
 
 ## Build
 
-wanctl requires the Go release named by the `go` directive in `go.mod` (currently 1.26.6); the Go tool downloads it automatically.
+wanctl requires the Go release named by the `go` directive in `go.mod` (currently 1.26.10); the Go tool downloads it automatically.
 
 ```bash
 go build -o wanctl .
@@ -108,6 +108,7 @@ wanctl portal --addr :8080
 wanctl agent --relay https://relay.example.com --token TOKEN --name DEVICE
 wanctl peers                          # your online devices, plus any shared with you
 wanctl exec --target DEVICE "uname -a"
+wanctl shell DEVICE                   # a prompt on a bypass-mode device: type ls, cd, cat as if logged in
 ```
 
 ## Documentation

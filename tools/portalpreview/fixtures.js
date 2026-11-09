@@ -47,6 +47,11 @@
   // 的 pairTTL 和 DecidePair 决定，工装只是把那个结果摆出来。
   var pairGone = new URLSearchParams(location.search).get('pairgone') === '1';
 
+  // ?adb=connected|no_port|unpaired|confirm|off|error 给安卓设备 bench-02 的控制台快照
+  // 带上 adb 链路状态（v0.20.2，agent 自己探出来的那个值）。不给就是旧 agent：
+  // 快照里没有 adb 字段，卡片只摆配对表单。
+  var adbState = new URLSearchParams(location.search).get('adb') || '';
+
   // ?now=<毫秒> 把「现在」钉住。页面上每一个时间都是从它算出来的，不钉住的话
   // 两次截图之间光是钟走了几分钟就够让每一张都不一样，前后对比无从做起。
   var now = Number(new URLSearchParams(location.search).get('now')) || Date.now();
@@ -140,12 +145,15 @@
     }
   };
 
+  // 形状照抄设备的 eventlog.Event（裁决是设备写的英文原值），以及门户
+  // handleDeviceLogs 合并后的样子：同一来源连续的连接带 count 和 first_ts。
   var logs = [
-    { ts: ago(90), type: 'exec', detail: 'nvidia-smi --query-gpu=memory.used --format=csv', peer_name: 'studio', decision: 'allowed by rule', exit: 0 },
-    { ts: ago(340), type: 'exec', detail: 'python train.py --epochs 40 --resume', cwd: '/data', peer_name: 'studio', decision: 'allowed by rule', exit: 0 },
-    { ts: ago(910), type: 'file', detail: 'read /data/config.yaml', peer_name: 'studio', decision: 'allowed once', exit: 0 },
-    { ts: ago(1800), type: 'exec', detail: 'shutdown -h now', peer_name: 'kestrel', decision: 'denied by owner', exit: 1 },
-    { ts: ago(3600), type: 'connect', detail: 'session opened', peer_name: 'portal', decision: '', exit: null }
+    { ts: ago(90), type: 'exec', detail: 'nvidia-smi --query-gpu=memory.used --format=csv', peer_name: 'studio', decision: 'pre-approved', exit: 0 },
+    { ts: ago(340), type: 'exec', detail: 'python train.py --epochs 40 --resume', cwd: '/data', peer_name: 'studio', decision: 'remembered:dir', exit: 0 },
+    { ts: ago(910), type: 'file', detail: 'read /data/config.yaml', peer_name: 'studio', decision: 'approved' },
+    { ts: ago(1800), type: 'exec', detail: 'shutdown -h now', peer_name: 'kestrel', decision: 'denied' },
+    { ts: ago(2400), type: 'connect', peer_name: 'kestrel', decision: 'rejected:unpaired' },
+    { ts: ago(3600), first_ts: ago(5 * 3600), count: 42, type: 'connect', peer_name: 'portal', decision: 'accepted' }
   ];
 
   var db = {
@@ -224,7 +232,8 @@
       health: { result: 'success', attempted_at: ago(400) }
     },
     '/api/releases': {
-      current: 'v0.3.4',
+      // ?ver=v0.20.2-dev 改页头的版本号：截图给人看的时候，版本要对得上正在评审的那一版。
+      current: new URLSearchParams(location.search).get('ver') || 'v0.3.4',
       releases: [
         { version: 'v0.3.4', body: '# v0.3.4\n\n**The install script a relay serves now installs from that relay.**\n\n## Install\n\n- A relay rewrites its own `/install.sh` and `/install.ps1` to download from its own `/dl` mirror, so nothing extra has to be set:\n\n  ```bash\n  curl -fsSL https://relay.example.com/install.sh | sh\n  ```\n  ```powershell\n  irm https://relay.example.com/install.ps1 | iex\n  ```\n\n  Until now a relay served the script baked in at release time, whose download base pointed at GitHub — and the people who fetch a script from a relay are usually exactly the ones who cannot reach that page.\n\n## Upgrade\n\n- New `wanctl config set release_base=…`, which picks where `wanctl update` fetches signed artefacts from:\n\n  ```bash\n  wanctl config set release_base=https://relay.example.com/dl\n  ```\n\n  `WANCTL_RELEASE_BASE` still wins over it.\n' },
         { version: 'v0.3.3', body: '## Security\n\n- Release artefacts are verified against their signature, size and SHA-256 before anything is written to disk.\n' }
@@ -248,7 +257,7 @@
       if (p === '/api/acl') return { acl: [] };
     }
     if (p === '/api/access-requests/decide') return {};
-    if (p === '/api/devices/console') { var st = consoles[new URLSearchParams(url.split('?')[1]).get('device')]; if (st) { var android = new URLSearchParams(url.split('?')[1]).get('device') === 'bench-02'; st.info = {platform:android?'android':'linux', adb_pair:android}; } }
+    if (p === '/api/devices/console') { var st = consoles[new URLSearchParams(url.split('?')[1]).get('device')]; if (st) { var android = new URLSearchParams(url.split('?')[1]).get('device') === 'bench-02'; st.info = {platform:android?'android':'linux', adb_pair:android}; if (android && adbState) st.adb = adbState === 'error' ? {state:'error', reason:'connected to adbd on port 41031 but `id` failed: EOF'} : adbState === 'confirm' ? {state:'confirm', reason:'adbd on port 41031 is waiting for someone to allow wanctl\'s key on the device screen'} : {state:adbState}; } }
     if (p === '/api/devices/console') return consoles[new URLSearchParams(url.split('?')[1]).get('device')] || { mode: 'normal', pending: [], pending_pairings: [], rules: [], trusted: [] };
     if (p === '/api/devices/logs') return { logs: logs.slice().reverse() };
     if (p === '/api/devices/lark') return { approval_enabled: true, pairing_from_card: false, notify_email: 'you@example.com', delivery_health: { result: 'success', attempted_at: ago(300) } };
@@ -341,7 +350,7 @@
         out = { device: mw.device, grantee: mw.grantee, manage: mw.manage === true };
       }
       if (url.indexOf('/api/tokens') === 0) out = { token: 'wanctl_9fQ2mXbLpR7tZv4NcKwJaHe1UgSoD5iM3xNrTqCEy' };
-      if (url.indexOf('/api/invites') === 0) out = { code: 'winv_4TmQb9RvNc7WpLd2FjKa5Y' };
+      if (url.indexOf('/api/invites') === 0) out = { id: 5, github_login: 'wren' };
       return Promise.resolve(new Response(JSON.stringify(out), { status: 200, headers: { 'Content-Type': 'application/json' } }));
     }
     return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }));

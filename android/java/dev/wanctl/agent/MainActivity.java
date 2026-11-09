@@ -36,13 +36,27 @@ import java.util.concurrent.Executors;
 
 /** Native, dependency-free setup: permissions, instance, sign-in, one run control. */
 public final class MainActivity extends Activity {
+    /** Opens a page directly; the approval test notification uses it for its setup step. */
+    static final String EXTRA_PAGE = "dev.wanctl.agent.page";
+    /** The test reminder's tap: the setup page, asking at once whether the reminder rang. */
+    static final String PAGE_ALERT_CHECK = "alert_check";
     private static final String HOSTED_PORTAL = "https://wanctl.z10.dev";
     private static final String HOSTED_RELAY = "https://wanctl-relay.z10.dev";
     private static final int INK = Color.rgb(29, 29, 31), MUTED = Color.rgb(105, 105, 110);
     private static final int BLUE = Color.rgb(0, 102, 204), CANVAS = Color.rgb(250, 250, 252);
+    /** Only for the dot on 设置 that says something there waits for the owner. */
+    private static final int RED = Color.rgb(255, 59, 48);
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable onStateChange = this::renderState;
+    private final Runnable onCards = this::renderApprovals;
+    /** Moves the rows' countdowns; the rows themselves are rebuilt only when a card changes. */
+    private final java.util.List<Runnable> countdowns = new java.util.ArrayList<>();
+    private final Runnable tick = this::tickApprovals;
+    /** How long a result the owner gave on the home card stays there before the next card. */
+    private static final long RESULT_MS = 1500;
+    /** The card the owner answered on the home screen, whose result the card shows briefly. */
+    private String answering = "";
     private Prefs prefs;
     private Installer installer;
     private LinearLayout body, footer;
@@ -50,9 +64,15 @@ public final class MainActivity extends Activity {
     private boolean settingsFlow;
     private String pendingPage = "";
     private TextView homeCaption;
+    /** The home screen's two faces: the oldest request, or the connection and at most one fix. */
+    private LinearLayout approvalPane, statusPane, problemBox;
+    private String problemShown = "";
+    private View headerDot, settingsDot;
+    private TextView headerDotLabel;
+    private TextView elevationState;
+    private boolean askAlert, permissionsFromHome;
     private ConnectionMark connectionMark;
     private TextView status;
-    private Button power;
     private String page = "",
             configuredRelay = "",
             configuredPortal = "",
@@ -76,7 +96,8 @@ public final class MainActivity extends Activity {
             draftRelay = state.getString("draft_relay");
             draftPortal = state.getString("draft_portal");
             permissionsFromSettings = state.getBoolean("permissions_from_settings");
-        }
+            permissionsFromHome = state.getBoolean("permissions_from_home");
+        } else receivePage(getIntent());
         route();
         receiveLogin(getIntent());
     }
@@ -86,6 +107,7 @@ public final class MainActivity extends Activity {
         state.putString("page", page);
         state.putBoolean("settings_flow", settingsFlow);
         state.putBoolean("permissions_from_settings", permissionsFromSettings);
+        state.putBoolean("permissions_from_home", permissionsFromHome);
         if (page.equals("custom") && relayField != null) {
             state.putString("draft_relay", relayField.getText().toString());
             state.putString("draft_portal", portalField.getText().toString());
@@ -97,14 +119,27 @@ public final class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        receivePage(intent);
         receiveLogin(intent);
+    }
+
+    private void receivePage(Intent intent) {
+        String want = intent.getStringExtra(EXTRA_PAGE);
+        if (!"permissions".equals(want) && !PAGE_ALERT_CHECK.equals(want)) return;
+        intent.removeExtra(EXTRA_PAGE);
+        askAlert = PAGE_ALERT_CHECK.equals(want);
+        permissionsFromSettings = true;
+        if (ready) showPermissions();
+        else pendingPage = "permissions";
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         AgentState.get().addListener(onStateChange);
+        ApprovalNotifier.listen(onCards);
         if (page.equals("permissions")) showPermissions();
+        renderApprovals();
         if (connectionMark != null) connectionMark.resume();
         probe();
     }
@@ -112,6 +147,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onPause() {
         AgentState.get().removeListener(onStateChange);
+        ApprovalNotifier.unlisten(onCards);
+        main.removeCallbacks(tick);
+        main.removeCallbacks(onCards);
         stopAnimation();
         if (connectionMark != null) connectionMark.pause();
         super.onPause();
@@ -172,6 +210,10 @@ public final class MainActivity extends Activity {
             showInstances();
             return;
         }
+        if (page.equals("approvals") && loggedIn) {
+            showApprovals();
+            return;
+        }
         if (configuredRelay.isEmpty() || configuredPortal.isEmpty()) showInstances();
         else if (!loggedIn) showLogin();
         else showHome();
@@ -194,8 +236,18 @@ public final class MainActivity extends Activity {
         navigateBack = back;
         status = null;
         homeCaption = null;
+        approvalPane = null;
+        statusPane = null;
+        problemBox = null;
+        problemShown = "";
+        headerDot = null;
+        headerDotLabel = null;
+        settingsDot = null;
+        elevationState = null;
+        main.removeCallbacks(tick);
+        main.removeCallbacks(onCards);
+        countdowns.clear();
         connectionMark = null;
-        power = null;
         LinearLayout outer = new LinearLayout(this);
         outer.setOrientation(LinearLayout.VERTICAL);
         outer.setBackgroundColor(CANVAS);
@@ -228,12 +280,8 @@ public final class MainActivity extends Activity {
         brand.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         brand.setGravity(Gravity.CENTER_VERTICAL);
         if (back == null) brand.setPadding(dp(8), 0, 0, 0);
-        header.addView(brand, new LinearLayout.LayoutParams(0, dp(52), 1));
-        if (next.equals("home")) {
-            Button setting = button("设置", false, this::showSettings);
-            setting.setTextColor(INK);
-            header.addView(setting, new LinearLayout.LayoutParams(dp(64), dp(48)));
-        }
+        if (next.equals("home")) homeHeader(header, brand);
+        else header.addView(brand, new LinearLayout.LayoutParams(0, dp(52), 1));
         outer.addView(header);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -352,7 +400,7 @@ public final class MainActivity extends Activity {
         return row;
     }
 
-    private void row(LinearLayout group, String label, String value, Runnable action) {
+    private LinearLayout row(LinearLayout group, String label, String value, Runnable action) {
         LinearLayout row = listRow(group);
         TextView name = text(label, 16, INK);
         row.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
@@ -377,6 +425,7 @@ public final class MainActivity extends Activity {
                         if (!busy) action.run();
                     });
         }
+        return row;
     }
 
     private void note(String message) {
@@ -451,13 +500,14 @@ public final class MainActivity extends Activity {
         screen(
                 "permissions",
                 fromSettings ? "通知与后台运行" : "初次设置",
-                fromSettings ? this::showSettings : null);
+                !fromSettings ? null : permissionsFromHome ? this::showHome : this::showSettings);
         if (!fromSettings) {
             title("保持连接", "开启通知和后台运行，让连接在息屏后也能继续。");
             SetupGuide guide = new SetupGuide(this, notificationsGranted(), batteryGranted());
             body.addView(guide, new LinearLayout.LayoutParams(-1, dp(140)));
             gap(16);
         }
+        if (prefs.approvalPhone()) approvalGuide();
         LinearLayout permissions = group(fromSettings ? "运行权限" : "");
         row(
                 permissions,
@@ -487,6 +537,75 @@ public final class MainActivity extends Activity {
                         page = "";
                         route();
                     });
+        if (askAlert) {
+            askAlert = false;
+            main.postDelayed(this::confirmAlert, 400);
+        }
+    }
+
+    /**
+     * The approval phone's three steps, first on the page because each one, missed, loses
+     * requests: ColorOS kills wanctl when it is swiped out of recents, and switches banners,
+     * sound and vibration off per app for sideloaded apps (S13). Nothing the app can read says
+     * whether the last two are on, so the step is done when the owner says a test rang.
+     */
+    private void approvalGuide() {
+        LinearLayout keep = group("审批手机：保持在线");
+        row(keep, "在最近任务中锁定 wanctl", "怎么锁定", this::showLockHelp);
+        note("从最近任务里上划清理，会直接停掉 wanctl：手机随即掉线，收不到审批，要重新打开 wanctl 才恢复。");
+        LinearLayout alerts = group("审批手机：提醒要响");
+        row(alerts, "横幅、锁屏、铃声、振动", "去打开", this::openAppNotifications);
+        row(alerts, "测试提醒", prefs.approvalAlertOk() ? "已确认" : "未确认", this::testAlert);
+        note("这四项部分系统对侧载应用默认关闭，要在 wanctl 的通知设置里逐个打开。打开后发一条测试提醒，听到响声、看到横幅才算设好。锁屏上只显示「有 1 个待审批请求」，解锁后才能看到具体命令。");
+    }
+
+    private void showLockHelp() {
+        new AlertDialog.Builder(this)
+                .setTitle("在最近任务中锁定 wanctl")
+                .setMessage("1. 打开最近任务（从屏幕底部上滑并停住）。\n"
+                        + "2. 在 wanctl 的卡片上点右上角的「⋮」，选「锁定」。有的系统版本是下拉卡片，或长按卡片。\n"
+                        + "3. 卡片上出现锁的标志就好了。以后清理最近任务不会再停掉它。")
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
+    private void testAlert() {
+        if (!notificationsGranted()) {
+            requestNotifications();
+            return;
+        }
+        ApprovalNotifier.test(this);
+        main.postDelayed(this::confirmAlert, 3000);
+    }
+
+    /** 「响了吗」: yes finishes the step; no goes straight to wanctl's notification settings. */
+    private void confirmAlert() {
+        if (isFinishing() || isDestroyed() || !page.equals("permissions")) return;
+        new AlertDialog.Builder(this)
+                .setTitle("测试提醒响了吗？")
+                .setMessage("要同时听到提示音、看到屏幕顶部弹出的横幅。")
+                .setPositiveButton("响了，也看到了", (d, w) -> {
+                    prefs.setApprovalAlertOk(true);
+                    showPermissions();
+                })
+                .setNegativeButton("没有", (d, w) -> {
+                    prefs.setApprovalAlertOk(false);
+                    showPermissions();
+                    new AlertDialog.Builder(this)
+                            .setTitle("打开 wanctl 的提醒")
+                            .setMessage("下一页是 wanctl 的通知设置。把「允许通知」和横幅、锁屏、铃声、振动都打开；有「待审批」这一类的话，点进去同样打开。回来后再发一次测试提醒。")
+                            .setPositiveButton("去打开", (d2, w2) -> openAppNotifications())
+                            .show();
+                })
+                .setNeutralButton("再发一次", (d, w) -> testAlert())
+                .show();
+    }
+
+    private void openAppNotifications() {
+        ApprovalNotifier.channel(this);
+        openSettings(
+                new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
     }
 
     private void requestNotifications() {
@@ -743,57 +862,328 @@ public final class MainActivity extends Activity {
                 });
     }
 
+    /**
+     * The home screen answers one question at a time (v0.20.4). With a request waiting it is that
+     * request, the oldest one, with its buttons on it; otherwise it is the connection, and below
+     * it at most the one thing that most needs fixing. Run controls and the reminder setup live
+     * in 设置.
+     */
     private void showHome() {
         settingsFlow = false;
         permissionsFromSettings = false;
+        permissionsFromHome = false;
+        if (firstApprovalGuide()) return;
         screen("home", "wanctl", null);
-        spring();
+        approvalPane = new LinearLayout(this);
+        approvalPane.setOrientation(LinearLayout.VERTICAL);
+        body.addView(approvalPane, new LinearLayout.LayoutParams(-1, -2));
+        statusPane = new LinearLayout(this);
+        statusPane.setOrientation(LinearLayout.VERTICAL);
+        statusPane.setGravity(Gravity.CENTER);
+        body.addView(statusPane, new LinearLayout.LayoutParams(-1, 0, 1));
         connectionMark = new ConnectionMark(this);
         LinearLayout.LayoutParams logoSize = new LinearLayout.LayoutParams(dp(128), dp(128));
         logoSize.gravity = Gravity.CENTER_HORIZONTAL;
-        body.addView(connectionMark, logoSize);
-        gap(8);
-        TextView device =
-                text(prefs.deviceName().isEmpty() ? Build.MODEL : prefs.deviceName(), 14, MUTED);
-        device.setGravity(Gravity.CENTER);
-        body.addView(device);
-        gap(12);
+        logoSize.bottomMargin = dp(20);
+        statusPane.addView(connectionMark, logoSize);
         status = text("", 32, INK);
         status.setGravity(Gravity.CENTER);
-        body.addView(status);
-        gap(12);
+        statusPane.addView(status);
         homeCaption = text("", 16, MUTED);
         homeCaption.setGravity(Gravity.CENTER);
-        body.addView(homeCaption);
-        spring();
-        power =
-                footerAction(
-                        "启用",
-                        true,
-                        () -> {
-                            if (prefs.enabled()) {
-                                prefs.setEnabled(false);
-                                KeeperJob.cancel(this);
-                                AgentService.stop(this);
-                            } else {
-                                prefs.setEnabled(true);
-                                KeeperJob.schedule(this);
-                                AgentService.start(this);
-                            }
-                            renderState();
-                        });
+        homeCaption.setPadding(0, dp(12), 0, 0);
+        statusPane.addView(homeCaption);
+        problemBox = new LinearLayout(this);
+        problemBox.setOrientation(LinearLayout.VERTICAL);
+        problemBox.setPadding(0, dp(28), 0, 0);
+        statusPane.addView(problemBox, new LinearLayout.LayoutParams(-1, -2));
+        // Optical centre: the pane sits a little above the middle.
+        statusPane.setPadding(0, 0, 0, dp(64));
         renderState();
+        renderApprovals();
+    }
+
+    /** 「wanctl ● 在线 … 设置」: the dot only shows while a request fills the screen. */
+    private void homeHeader(LinearLayout header, TextView brand) {
+        header.addView(brand, new LinearLayout.LayoutParams(-2, dp(52)));
+        LinearLayout dot = new LinearLayout(this);
+        dot.setGravity(Gravity.CENTER_VERTICAL);
+        dot.setPadding(dp(12), 0, 0, 0);
+        dot.setVisibility(View.GONE);
+        View circle = new View(this);
+        dot.addView(circle, new LinearLayout.LayoutParams(dp(8), dp(8)));
+        headerDotLabel = text("", 13, MUTED);
+        headerDotLabel.setPadding(dp(6), 0, 0, 0);
+        dot.addView(headerDotLabel);
+        headerDot = dot;
+        header.addView(dot, new LinearLayout.LayoutParams(-2, dp(52)));
+        header.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+        android.widget.FrameLayout settings = new android.widget.FrameLayout(this);
+        Button setting = button("设置", false, this::showSettings);
+        setting.setTextColor(INK);
+        settings.addView(setting, new android.widget.FrameLayout.LayoutParams(-1, -1));
+        settingsDot = new View(this);
+        settingsDot.setBackground(shape(RED, 4));
+        settingsDot.setVisibility(View.GONE);
+        android.widget.FrameLayout.LayoutParams at =
+                new android.widget.FrameLayout.LayoutParams(dp(8), dp(8), Gravity.TOP | Gravity.END);
+        at.topMargin = dp(10);
+        at.rightMargin = dp(8);
+        settings.addView(settingsDot, at);
+        header.addView(settings, new LinearLayout.LayoutParams(dp(64), dp(48)));
+    }
+
+    /** True when the reminder setup still waits for the owner: the dot on 设置 and its row. */
+    private boolean alertUnconfirmed() {
+        return prefs.approvalPhone() && !prefs.approvalAlertOk();
+    }
+
+    /**
+     * The first time this phone becomes the approval phone, the guide opens by itself, once.
+     * Returns true when it did.
+     */
+    private boolean firstApprovalGuide() {
+        if (!prefs.approvalPhone() || prefs.approvalGuideShown()) return false;
+        prefs.setApprovalGuideShown();
+        if (prefs.approvalAlertOk()) return false;
+        permissionsFromSettings = true;
+        permissionsFromHome = true;
+        showPermissions();
+        return true;
+    }
+
+    private void renderApprovals() {
+        main.removeCallbacks(tick);
+        main.removeCallbacks(onCards);
+        countdowns.clear();
+        if (page.equals("approvals")) {
+            renderApprovalList();
+            return;
+        }
+        if (approvalPane == null) return;
+        if (firstApprovalGuide()) return;
+        approvalPane.removeAllViews();
+        java.util.List<ApprovalNotifier.Card> queue = ApprovalNotifier.open(this);
+        ApprovalNotifier.Card head = queue.isEmpty() ? null : queue.get(0);
+        // A result the owner gave here stays on the card for RESULT_MS, and a redraw is booked
+        // for the moment it ends: the card must never wait on some later event to go away.
+        ApprovalNotifier.Card answered =
+                answering.isEmpty() ? null : ApprovalNotifier.card(this, answering);
+        if (answered != null && ApprovalNotifier.DONE.equals(answered.state)) {
+            long left = RESULT_MS - (System.currentTimeMillis() - answered.seen);
+            if (left > 0) {
+                head = answered;
+                main.postDelayed(onCards, left);
+            } else answering = "";
+        } else if (head == null || !head.id.equals(answering)) answering = "";
+        boolean any = head != null;
+        approvalPane.setVisibility(any ? View.VISIBLE : View.GONE);
+        if (statusPane != null) statusPane.setVisibility(any ? View.GONE : View.VISIBLE);
+        if (headerDot != null) headerDot.setVisibility(any ? View.VISIBLE : View.GONE);
+        if (!any) return;
+        LinearLayout saved = body;
+        body = approvalPane;
+        headCard(head);
+        // Counted by id: the reader thread may finish the head card between open() and here.
+        int more = 0;
+        for (ApprovalNotifier.Card k : queue) if (!k.id.equals(head.id)) more++;
+        if (more > 0) {
+            gap(12);
+            row(group(""), "还有 " + more + " 条", "", this::showApprovals);
+        }
+        body = saved;
+        if (!countdowns.isEmpty()) main.postDelayed(tick, 1000);
+    }
+
+    private void tickApprovals() {
+        // A copy: a countdown may redraw the screen, which rebuilds the list.
+        for (Runnable r : new java.util.ArrayList<>(countdowns)) r.run();
+        main.removeCallbacks(tick);
+        if (!countdowns.isEmpty()) main.postDelayed(tick, 1000);
+    }
+
+    /**
+     * The oldest request with everything needed to decide it — device, the whole command, who
+     * asks, how long is left — and the decision on the card itself. Tapping the card opens the
+     * detail screen (working directory, fingerprint).
+     */
+    private void headCard(ApprovalNotifier.Card k) {
+        LinearLayout card = group("");
+        card.setPadding(dp(20), dp(20), dp(20), dp(12));
+        TextView title = text(ApprovalNotifier.title(k), 20, INK);
+        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        card.addView(title);
+        if (k.pairing()) {
+            TextView why = text("这个控制端第一次连接。信任之后它就能控制这台设备。", 15, MUTED);
+            why.setPadding(0, dp(8), 0, 0);
+            card.addView(why);
+        }
+        String subject = !k.cmd.isEmpty() ? k.cmd : k.path;
+        if (!subject.isEmpty()) {
+            TextView cmd = text(subject, 15, INK);
+            cmd.setTypeface(Typeface.MONOSPACE);
+            cmd.setPadding(dp(12), dp(10), dp(12), dp(10));
+            cmd.setBackground(shape(CANVAS, 10));
+            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
+            p.topMargin = dp(14);
+            card.addView(cmd, p);
+        }
+        TextView meta = text("", 14, MUTED);
+        meta.setPadding(0, dp(12), 0, dp(8));
+        card.addView(meta);
+        Runnable from = () -> {
+            String left = ApprovalActivity.remaining(k);
+            meta.setText("来自 " + ApprovalNotifier.peerName(k) + (left.isEmpty() ? "" : " · " + left));
+        };
+        from.run();
+        if (!ApprovalActivity.remaining(k).isEmpty()) countdowns.add(from);
+        card.setOnClickListener(
+                v -> startActivity(new Intent(this, ApprovalActivity.class)
+                        .setData(ApprovalNotifier.uri(k.id))));
+        String[] choices = ApprovalNotifier.choices(k);
+        String status = ApprovalNotifier.status(k);
+        if (ApprovalNotifier.DONE.equals(k.state)) {
+            outcome(card, status, true);
+        } else if (choices != null) {
+            if (status != null) outcome(card, status, false);
+            cardButton(card, choices[0], true, () -> decideHere(k, "y"));
+            cardButton(card, choices[1], false, () -> decideHere(k, "n"));
+        } else if (ApprovalNotifier.verdict(k.id) != null) {
+            submitting(card, k);
+        }
+    }
+
+    /** As on the detail screen: answers only the card on screen, which may have moved on. */
+    private void decideHere(ApprovalNotifier.Card shown, String verdict) {
+        ApprovalNotifier.Card now = ApprovalNotifier.card(this, shown.id);
+        if (now == null || !now.state.equals(shown.state) || ApprovalNotifier.choices(now) == null) {
+            renderApprovals();
+            return;
+        }
+        // 忽略 only clears a lapsed request; there is no result worth holding the card for.
+        boolean ignore = ApprovalNotifier.EXPIRED.equals(now.state) && "n".equals(verdict);
+        answering = ignore ? "" : shown.id;
+        AgentService.decide(this, shown.id, verdict);
+        renderApprovals();
+    }
+
+    /** 「提交中…」, then past SUBMIT_SLOW_MS what the detail screen says: not delivered, resend. */
+    private void submitting(LinearLayout card, ApprovalNotifier.Card k) {
+        if (!ApprovalNotifier.slow(k.id)) {
+            Button b = cardButton(card, "提交中…", true, () -> {});
+            b.setEnabled(false);
+            b.setAlpha(.6f);
+            // Redraw once it turns slow, so the resend offer appears on its own.
+            countdowns.add(() -> {
+                if (ApprovalNotifier.slow(k.id)) renderApprovals();
+            });
+            return;
+        }
+        if (!prefs.enabled()) {
+            outcome(card, "还没送达：wanctl 已停用", false);
+            cardButton(card, "启用并重新提交", true, () -> {
+                enable();
+                AgentService.retry(this, k.id);
+                renderApprovals();
+            });
+            return;
+        }
+        outcome(card, "还没送达", false);
+        TextView why = text("手机可能没联网，或 wanctl 没连上服务。联网后会自动重发，也可以现在再发一次。", 14, MUTED);
+        why.setGravity(Gravity.CENTER);
+        why.setPadding(0, 0, 0, dp(8));
+        card.addView(why);
+        cardButton(card, "重新提交", true, () -> {
+            AgentService.retry(this, k.id);
+            renderApprovals();
+        });
+    }
+
+    private void outcome(LinearLayout card, String text, boolean done) {
+        TextView t = text(text, done ? 20 : 17, INK);
+        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(0, dp(8), 0, dp(done ? 16 : 8));
+        card.addView(t);
+    }
+
+    private Button cardButton(LinearLayout card, String label, boolean primary, Runnable run) {
+        Button b = button(label, primary, run);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
+        p.topMargin = dp(4);
+        card.addView(b, p);
+        return b;
+    }
+
+    /** 「还有 N 条」: every open request, oldest first; each opens its detail screen. */
+    private void showApprovals() {
+        screen("approvals", "待审批", this::showHome);
+        renderApprovals();
+    }
+
+    private void renderApprovalList() {
+        body.removeAllViews();
+        java.util.List<ApprovalNotifier.Card> queue = ApprovalNotifier.open(this);
+        if (queue.isEmpty()) {
+            showHome();
+            return;
+        }
+        LinearLayout list = group("");
+        for (ApprovalNotifier.Card k : queue) approvalRow(list, k);
+        if (!countdowns.isEmpty()) main.postDelayed(tick, 1000);
+    }
+
+    private void approvalRow(LinearLayout group, ApprovalNotifier.Card k) {
+        separator(group);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(dp(16), dp(12), dp(16), dp(12));
+        row.addView(text(ApprovalNotifier.title(k), 16, INK));
+        String subject = !k.cmd.isEmpty() ? k.cmd : k.path;
+        if (!subject.isEmpty()) {
+            TextView cmd = text(subject, 14, INK);
+            cmd.setTypeface(Typeface.MONOSPACE);
+            cmd.setMaxLines(2);
+            cmd.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            cmd.setPadding(0, dp(4), 0, 0);
+            row.addView(cmd);
+        }
+        TextView m = text("", 13, MUTED);
+        m.setPadding(0, dp(4), 0, 0);
+        row.addView(m);
+        Runnable meta = () -> {
+            String st = ApprovalNotifier.status(k), left = ApprovalActivity.remaining(k);
+            m.setText("来自 " + ApprovalNotifier.peerName(k)
+                    + (st != null ? " · " + st : left.isEmpty() ? "" : " · " + left));
+        };
+        meta.run();
+        if (!ApprovalActivity.remaining(k).isEmpty()) countdowns.add(meta);
+        row.setBackground(
+                new RippleDrawable(ColorStateList.valueOf(0x11000000), null, shape(Color.WHITE, 12)));
+        row.setOnClickListener(
+                v -> startActivity(new Intent(this, ApprovalActivity.class)
+                        .setData(ApprovalNotifier.uri(k.id))));
+        group.addView(row, new LinearLayout.LayoutParams(-1, -2));
     }
 
     private void renderState() {
+        if (elevationState != null) paintElevation();
         if (!page.equals("home") || status == null) return;
         AgentState s = AgentState.get();
+        boolean online = s.phase() == AgentState.Phase.ONLINE;
         connectionMark.setState(s.phase(), prefs.enabled());
+        View circle = ((LinearLayout) headerDot).getChildAt(0);
+        GradientDrawable d = shape(online ? BLUE : Color.TRANSPARENT, 4);
+        if (!online) d.setStroke(dp(1.5f), MUTED);
+        circle.setBackground(d);
+        headerDotLabel.setText(online ? "在线" : "离线");
+        headerDot.setContentDescription(online ? "在线" : "离线");
+        settingsDot.setVisibility(alertUnconfirmed() ? View.VISIBLE : View.GONE);
         String label, detail;
         switch (s.phase()) {
             case ONLINE:
                 label = "已连接";
-                detail = "现在可以从你的空间远程连接这台手机。";
+                detail = "现在可以远程使用这台手机。";
                 break;
             case STARTING:
             case RETRYING:
@@ -802,18 +1192,123 @@ public final class MainActivity extends Activity {
                 break;
             case ERROR:
                 label = "连接未完成";
-                detail = "轻点状态查看原因，或前往设置重新登录。";
+                detail = "";
                 break;
             default:
                 label = prefs.enabled() ? "正在连接" : "未启用";
-                detail = prefs.enabled() ? "正在启动连接，请稍等。" : "启用后，可从你的空间远程连接这台手机。";
+                detail = prefs.enabled() ? "正在启动连接，请稍等。" : "";
         }
         status.setText(label);
-        status.setTextColor(INK);
+        String problem = problem(s);
         homeCaption.setText(detail);
-        power.setText(prefs.enabled() ? "停用" : "启用");
-        status.setOnClickListener(
-                s.phase() == AgentState.Phase.ERROR ? v -> error("连接未完成", s.detail()) : null);
+        homeCaption.setVisibility(problem == null && !detail.isEmpty() ? View.VISIBLE : View.GONE);
+        String key = problem == null ? "" : problem;
+        if (key.equals(problemShown)) return;
+        problemShown = key;
+        problemBox.removeAllViews();
+        if (problem == null) return;
+        LinearLayout saved = body;
+        body = problemBox;
+        LinearLayout r = row(group(""), "需要处理：" + problem, "", () -> fix(problem));
+        ((TextView) r.getChildAt(0)).setTextColor(INK);
+        body = saved;
+    }
+
+    /**
+     * The one thing that most needs the owner, or null: offline first (stopped, or a failure
+     * retrying cannot fix), then a reminder nobody has confirmed rings, then an elevation channel
+     * the owner allowed that is not connected. Reconnecting is not a problem; it fixes itself.
+     */
+    private String problem(AgentState s) {
+        if (!prefs.enabled()) return "wanctl 未启用";
+        if (s.phase() == AgentState.Phase.ERROR) return "连接未完成";
+        if (alertUnconfirmed()) return "审批提醒还没确认会响";
+        String link = AgentState.get().adbLink();
+        if (prefs.elevation()
+                && s.phase() == AgentState.Phase.ONLINE
+                && !link.isEmpty()
+                && !link.equals("connected")
+                && !link.equals("off")) return "提权通道还没连通";
+        return null;
+    }
+
+    /** One tap from 「需要处理」 to the fix. */
+    private void fix(String problem) {
+        switch (problem) {
+            case "wanctl 未启用":
+                enable();
+                break;
+            case "连接未完成":
+                confirm("连接未完成", AgentState.get().detail(), "重新登录", () -> {
+                    settingsFlow = true;
+                    showLogin();
+                });
+                break;
+            case "审批提醒还没确认会响":
+                permissionsFromSettings = true;
+                permissionsFromHome = true;
+                showPermissions();
+                break;
+            default:
+                showAdvanced();
+        }
+    }
+
+    private void enable() {
+        prefs.setEnabled(true);
+        KeeperJob.schedule(this);
+        AgentService.start(this);
+        renderState();
+    }
+
+    private void disable() {
+        prefs.setEnabled(false);
+        KeeperJob.cancel(this);
+        AgentService.stop(this);
+    }
+
+    /**
+     * A two-button confirmation in the app's own look rather than the system dialog: white card,
+     * the page's type, the blue button on the right.
+     */
+    private void confirm(String title, String message, String yes, Runnable onYes) {
+        if (isFinishing() || isDestroyed()) return;
+        android.app.Dialog dialog = new android.app.Dialog(this);
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24), dp(24), dp(24), dp(16));
+        box.setBackground(shape(Color.WHITE, 20));
+        TextView t = text(title, 20, INK);
+        t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        box.addView(t);
+        if (message != null && !message.isEmpty()) {
+            TextView m = text(message, 15, MUTED);
+            m.setPadding(0, dp(10), 0, 0);
+            box.addView(m);
+        }
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setPadding(0, dp(20), 0, 0);
+        Button no = button("取消", false, dialog::dismiss);
+        Button ok = button(yes, true, () -> {
+            dialog.dismiss();
+            onYes.run();
+        });
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, -2, 1);
+        buttons.addView(no, half);
+        LinearLayout.LayoutParams right = new LinearLayout.LayoutParams(0, -2, 1);
+        right.leftMargin = dp(8);
+        buttons.addView(ok, right);
+        box.addView(buttons);
+        dialog.setContentView(box);
+        android.view.Window w = dialog.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            w.setLayout(
+                    Math.min(getResources().getDisplayMetrics().widthPixels - dp(48), dp(400)),
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+        }
+        dialog.show();
     }
 
     private void showSettings() {
@@ -843,14 +1338,24 @@ public final class MainActivity extends Activity {
                             .show();
                 });
         toggle(device, "开机自动启用", prefs.bootStart(), prefs::setBootStart);
-        row(
+        LinearLayout reminders = row(
                 device,
                 "通知与后台运行",
-                notificationsGranted() && batteryGranted() ? "已允许" : "待配置",
+                alertUnconfirmed()
+                        ? "审批提醒未确认"
+                        : notificationsGranted() && batteryGranted() ? "已允许" : "待配置",
                 () -> {
                     permissionsFromSettings = true;
                     showPermissions();
                 });
+        if (alertUnconfirmed()) {
+            // The same dot as on 设置, on the row it stands for.
+            View dot = new View(this);
+            dot.setBackground(shape(RED, 4));
+            LinearLayout.LayoutParams at = new LinearLayout.LayoutParams(dp(8), dp(8));
+            at.leftMargin = dp(8);
+            reminders.addView(dot, reminders.getChildCount() - 1, at);
+        }
         LinearLayout connection = group("连接");
         row(connection, "服务", serviceName(), this::showInstances);
         row(connection, "重新登录", loggedIn ? "已登录" : "未登录", this::showLogin);
@@ -864,6 +1369,23 @@ public final class MainActivity extends Activity {
                 BuildInfo.UPDATES_SUPPORTED ? "" : "预览版",
                 () -> installer.checkAndInstall());
         note(BuildInfo.UPDATES_SUPPORTED ? "wanctl " + BuildInfo.VERSION : "wanctl Preview · 预览版");
+        spring();
+        // Moved off the home screen (v0.20.4): stopping is rare and takes the phone offline.
+        if (prefs.enabled())
+            action("停用 wanctl", false, () -> confirm(
+                    "停用 wanctl？",
+                    prefs.approvalPhone()
+                            ? "停用后这台手机会离线：不能被远程使用，也收不到审批请求。"
+                            : "停用后这台手机会离线，不能被远程使用。",
+                    "停用",
+                    () -> {
+                        disable();
+                        showSettings();
+                    }));
+        else action("启用 wanctl", false, () -> {
+            enable();
+            showSettings();
+        });
     }
 
     private void showAdvanced() {
@@ -899,9 +1421,39 @@ public final class MainActivity extends Activity {
                         restartIfRunning();
                     } else showElevationHelp();
                 });
+        if (prefs.elevation()) {
+            elevationState = text("", 14, MUTED);
+            elevationState.setPadding(dp(16), 0, dp(16), dp(12));
+            elevation.addView(elevationState);
+            paintElevation();
+        }
         row(elevation, "配置系统权限", "设置指引", this::showElevationHelp);
 
         note("截图、模拟点击等系统操作需要额外配置无线调试或 root。仅在使用这些功能时配置。");
+    }
+
+    /**
+     * The switch is the owner's consent; this line is whether it works. The agent probes adb and
+     * reports it (AgentState.adbLink), the same state the portal's ADB card shows.
+     */
+    private void paintElevation() {
+        String link = AgentState.get().adbLink();
+        String say;
+        switch (link) {
+            case "connected":
+                say = "已连通";
+                break;
+            case "unpaired":
+                say = "已允许，但配对已失效：在门户「设备设置 → ADB 无线调试」重新配对后生效";
+                break;
+            case "confirm":
+                say = "已允许，请在手机弹出的「允许 USB 调试吗」框里点允许";
+                break;
+            default:
+                say = "已允许，但还没连上无线调试，按指引配对后生效";
+        }
+        elevationState.setText(say);
+        elevationState.setTextColor(link.equals("connected") ? INK : MUTED);
     }
 
     private void showDetails() {
@@ -959,11 +1511,20 @@ public final class MainActivity extends Activity {
     }
 
     private void showElevationHelp() {
+        String vendor = Build.MANUFACTURER.toLowerCase(java.util.Locale.ROOT);
+        // HyperOS and MIUI refuse input injection to the shell uid until this
+        // Xiaomi-only switch is on, and nothing else on the phone says so.
+        String xiaomi =
+                vendor.contains("xiaomi") || vendor.contains("redmi")
+                        ? "小米和 Redmi 手机还需在开发者选项中打开「USB 调试（安全设置）」（需插 SIM 卡并登录小米账号），否则模拟点击和输入会被系统拒绝。\n\n"
+                        : "";
         new AlertDialog.Builder(this)
                 .setTitle("配置提权通道")
                 .setMessage(
                         "仅在需要控制系统、截图或模拟点击时开启。\n\n"
-                                + "无线调试：手机连接 Wi-Fi，打开开发者选项中的「无线调试」，点「使用配对码配对设备」并保持弹窗打开。在另一台设备的浏览器打开门户，选择这台手机，进入「设备设置 → ADB 配对」，填写弹窗里的端口和六位码。\n\n"
+                                + "无线调试：手机连接 Wi-Fi，打开开发者选项中的「无线调试」，点「使用配对码配对设备」并保持弹窗打开。在另一台设备的浏览器打开门户，选择这台手机，进入「设备设置 → ADB 无线调试」，填写弹窗里的端口和六位码。\n\n"
+                                + "重启、断开 Wi-Fi 或换到另一个接入点后，系统会关闭无线调试，需要重新打开；配对超过 7 天未使用会被系统撤销，需要重新配对（开发者选项中的「停用 adb 授权超时功能」可关闭这个期限）。\n\n"
+                                + xiaomi
                                 + "已 root 的手机可使用 root 通道。开启后仍需按系统提示授权。")
                 .setNegativeButton("关闭", (d, w) -> showAdvanced())
                 .setNeutralButton(
@@ -974,7 +1535,7 @@ public final class MainActivity extends Activity {
                             showAdvanced();
                         })
                 .setPositiveButton(
-                        "启用通道",
+                        "允许（配对后生效）",
                         (d, w) -> {
                             prefs.setElevation(true);
                             restartIfRunning();
@@ -1003,7 +1564,7 @@ public final class MainActivity extends Activity {
         String vendor = Build.MANUFACTURER.toLowerCase(java.util.Locale.ROOT);
         String detail;
         if (vendor.contains("oppo") || vendor.contains("oneplus") || vendor.contains("realme"))
-            detail = "在应用信息中打开「耗电管理」，允许后台活动；如有「自启动」选项，也请开启。";
+            detail = "在应用信息中打开「耗电管理」，允许后台活动；如有「自启动」选项，也请开启。最后在最近任务中锁定 wanctl，否则清理最近任务会强行停止它，下次打开前都不会自动恢复。";
         else if (vendor.contains("vivo")) detail = "在系统电池设置的「后台耗电管理」中找到 wanctl，选择「允许后台高耗电」，并允许自启动。";
         else if (vendor.contains("xiaomi") || vendor.contains("redmi"))
             detail = "在应用信息的「省电策略」中选择「无限制」，并允许自启动。";

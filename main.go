@@ -6,7 +6,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -31,6 +30,7 @@ import (
 	_ "wanctl/internal/androiddns"
 	"wanctl/internal/client"
 	"wanctl/internal/config"
+	"wanctl/internal/desktop"
 	"wanctl/internal/eventlog"
 	"wanctl/internal/limits"
 	mcppkg "wanctl/internal/mcp"
@@ -128,6 +128,12 @@ func configuredDisplay(value, empty string) string {
 }
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "__desktop-pipe" {
+		os.Exit(desktop.PipeHelperMain(os.Args[2]))
+	}
+	if len(os.Args) == 2 && os.Args[1] == "__desktop" {
+		os.Exit(desktop.HelperMain(os.Stdin, os.Stdout))
+	}
 	if len(os.Args) < 2 {
 		// Bare `wanctl` explains itself and does nothing else. It used to
 		// enroll and start an agent, so someone on a controller-only machine
@@ -174,8 +180,12 @@ func main() {
 		err = cmdExec(ctx, os.Args[2:])
 	case "workspace":
 		err = cmdWorkspace(ctx, os.Args[2:])
+	case "shell":
+		err = cmdShell(ctx, os.Args[2:])
 	case "screenshot":
 		err = cmdScreenshot(ctx, os.Args[2:])
+	case "act":
+		err = cmdAct(ctx, os.Args[2:])
 	case "push":
 		err = cmdPush(ctx, os.Args[2:])
 	case "pull":
@@ -242,7 +252,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "wanctl: "+err.Error())
+		fmt.Fprintln(os.Stderr, "wanctl: "+errorText(err))
 		os.Exit(1)
 	}
 }
@@ -256,8 +266,8 @@ func main() {
 // `relay`/`portal`. `agent` runs the same gate itself, after parsing --relay.
 var relayCommands = map[string]bool{
 	"start": true, "login": true,
-	"exec": true, "screenshot": true, "push": true, "pull": true,
-	"read": true, "edit": true, "write": true, "workspace": true,
+	"exec": true, "screenshot": true, "act": true, "push": true, "pull": true,
+	"read": true, "edit": true, "write": true, "workspace": true, "shell": true,
 	"peers": true, "pair": true, "friends": true, "share": true,
 	"docs": true, "admin": true,
 }
@@ -343,38 +353,47 @@ func cmdRelay(args []string) error {
 		if err != nil {
 			return fmt.Errorf("WANCTL_MCP_SEED must be hex-encoded: %w", err)
 		}
-		opts := mcppkg.Options{Seed: seed, EndpointPath: "/mcp"}
-		// OAuth needs three things the session path does not: somewhere durable
-		// to keep clients and refresh tokens, a public origin to publish as the
-		// issuer, and a portal to host the consent page. Without all three the
-		// endpoint keeps working exactly as before, on Mcp-Session-Id.
+		// The hosted endpoint authenticates with OAuth only (v0.19.0, ADR 0008),
+		// and OAuth needs three things: somewhere durable to keep clients and
+		// refresh tokens, a public origin to publish as the issuer, and a portal
+		// to host the consent page. Without all three nobody could get in, so
+		// /mcp says why instead of serving sessions no one can use.
+		missing := ""
 		switch {
 		case pgStore == nil:
-			log.Print("wanctl relay: MCP OAuth off (needs DATABASE_URL for clients and refresh tokens)")
+			missing = "DATABASE_URL (for OAuth clients and refresh tokens)"
 		case os.Getenv("WANCTL_PUBLIC_ORIGIN") == "":
-			log.Print("wanctl relay: MCP OAuth off (needs WANCTL_PUBLIC_ORIGIN as the issuer)")
+			missing = "WANCTL_PUBLIC_ORIGIN (the OAuth issuer)"
 		case os.Getenv("WANCTL_PORTAL") == "":
-			log.Print("wanctl relay: MCP OAuth off (needs WANCTL_PORTAL to host the consent page)")
-		default:
+			missing = "WANCTL_PORTAL (hosts the OAuth consent page)"
+		}
+		if missing != "" {
+			reason := "hosted MCP is off on this relay: it authenticates with OAuth only, which needs " + missing +
+				". AI hosts on your own machines can run the local stdio server, `wanctl mcp`."
+			log.Print("wanctl relay: " + reason)
+			r.SetMCPHandler(mcppkg.Unavailable(reason))
+		} else {
 			r.SetMCPOAuth(seed, pgStore)
-			opts.OAuth = &mcppkg.OAuthConfig{
-				ResourceMetadataURL: strings.TrimRight(os.Getenv("WANCTL_PUBLIC_ORIGIN"), "/") +
-					"/.well-known/oauth-protected-resource",
-				Live:   r.ResolveOAuthToken,
-				Revoke: r.RevokeOAuthRelayToken,
+			h, err := mcppkg.Handler(mcppkg.Options{
+				Seed:         seed,
+				EndpointPath: "/mcp",
+				OAuth: &mcppkg.OAuthConfig{
+					ResourceMetadataURL: strings.TrimRight(os.Getenv("WANCTL_PUBLIC_ORIGIN"), "/") +
+						"/.well-known/oauth-protected-resource",
+					Live:   r.ResolveOAuthToken,
+					Revoke: r.RevokeOAuthRelayToken,
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("mcp handler: %w", err)
 			}
-			log.Print("wanctl relay: MCP OAuth enabled (authorize on the portal, tokens at /oauth/token)")
+			r.SetMCPHandler(h)
+			// The MCP server keeps its pinned device identities in this process's
+			// memory. Unbinding a device has to reach them, the same way it reaches
+			// the portal's own store (ADR 0002).
+			r.SetPinForgetter(mcppkg.ForgetPinnedDevice)
+			log.Print("wanctl relay: MCP server enabled at /mcp (alias /wanctl-mcp, Streamable HTTP, OAuth; authorize on the portal, tokens at /oauth/token)")
 		}
-		h, err := mcppkg.HandlerWithOptions(opts)
-		if err != nil {
-			return fmt.Errorf("mcp handler: %w", err)
-		}
-		r.SetMCPHandler(h)
-		// The MCP server keeps its pinned device identities in this process's
-		// memory. Unbinding a device has to reach them, the same way it reaches
-		// the portal's own store (ADR 0002).
-		r.SetPinForgetter(mcppkg.ForgetPinnedDevice)
-		log.Print("wanctl relay: MCP server enabled at /mcp (alias /wanctl-mcp, Streamable HTTP)")
 	}
 	if seedHex := os.Getenv("WANCTL_WEBFETCH_SEED"); seedHex != "" {
 		if pgStore == nil {
@@ -448,6 +467,10 @@ func cmdPortal(args []string) error {
 		return err
 	}
 	p := portal.New(portal.Config{
+		SMTPAddr:        os.Getenv("WANCTL_SMTP_ADDR"),
+		SMTPUser:        os.Getenv("WANCTL_SMTP_USER"),
+		SMTPPassword:    os.Getenv("WANCTL_SMTP_PASSWORD"),
+		MailFrom:        os.Getenv("WANCTL_MAIL_FROM"),
 		GitHubTransport: githubTransport,
 		RelayAdminURL:   os.Getenv("RELAY_ADMIN_URL"),
 		AdminSecret:     os.Getenv("WANCTL_ADMIN_SECRET"),
@@ -503,6 +526,7 @@ func cmdAgent(ctx context.Context, args []string) error {
 	managed := fs.Bool("managed", false, "agent is owned by an external supervisor")
 	portalFPS := fs.String("portal-fps", config.PortalFingerprintsEnv(), "comma-separated portal admin fingerprints to seed locally")
 	portalPK := fs.String("portal-pk", "", "deprecated alias for one --portal-fps entry")
+	approvalsStdio := fs.Bool("approvals-stdio", false, "for the wanctl Android app, which runs the agent as its child: stdout carries approval cards (wanctl-approval lines) and stdin carries the owner's decisions")
 	fs.Parse(args)
 	portalRaw := *portalFPS
 	if *portalPK != "" {
@@ -526,7 +550,7 @@ func cmdAgent(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	ag, err := agent.New(agent.Options{RelayURL: *relayURL, Token: *token, Name: *name, Shell: *shell, AutoYes: *yes, Transport: *tr, Mode: policy.Mode(*mode), PortalFPs: parsedPortalFPs, Version: buildVersion})
+	ag, err := agent.New(agent.Options{RelayURL: *relayURL, Token: *token, Name: *name, Shell: *shell, AutoYes: *yes, Transport: *tr, Mode: policy.Mode(*mode), PortalFPs: parsedPortalFPs, Version: buildVersion, ApprovalsStdio: *approvalsStdio})
 	if err != nil {
 		return err
 	}
@@ -629,7 +653,10 @@ func cmdExec(ctx context.Context, args []string) error {
 	// Legacy exec forwards Ctrl-C to the device. Workspace exec only stops
 	// waiting: its device-owned request can be polled or explicitly cancelled.
 	// Both controller paths use the shell's conventional 128+SIGINT exit code.
-	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt)
+	// SIGTERM is treated the same way: it is what a tool that times a command
+	// out sends, and without it the device went on running the command and the
+	// relay held the abandoned session until its sweeper noticed.
+	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	fs := withHelp(flag.NewFlagSet("exec", flag.ExitOnError))
 	target := fs.String("target", "", "device ID or unique name (NS/DEV or DEV)")
@@ -710,11 +737,15 @@ func cmdExec(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	stdout, flushOut := deviceOutput(os.Stdout)
+	stderr, flushErr := deviceOutput(os.Stderr)
 	if ref.ID != "" {
 		code, err := execWorkspace(ctx, c, ref, protocol.Message{
 			Command: command, RequestID: *requestID, Cwd: *cwd,
 			OneShot: *oneShot, Elevate: *elevateFlag, Via: *via,
-		}, *scriptPath, *interp, *async, os.Stdout, os.Stderr)
+		}, *scriptPath, *interp, *async, stdout, stderr)
+		flushOut()
+		flushErr()
 		if ctx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "wanctl: stopped waiting; the remote command may still be running. Use workspace poll with the request_id above, or workspace cancel to stop it")
 			os.Exit(130)
@@ -724,10 +755,12 @@ func cmdExec(ctx context.Context, args []string) error {
 		}
 		os.Exit(code)
 	}
-	code, err := c.Exec(ctx, client.ExecRequest{
+	code, err := c.ExecTo(ctx, client.ExecRequest{
 		Target: *target, Command: command, OneShot: *oneShot, Cwd: *cwd,
 		Elevate: *elevateFlag, Via: *via,
-	})
+	}, stdout, stderr)
+	flushOut()
+	flushErr()
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "wanctl: interrupted — sent a cancel to the device")
@@ -736,86 +769,6 @@ func cmdExec(ctx context.Context, args []string) error {
 		return err
 	}
 	os.Exit(code)
-	return nil
-}
-
-// cmdScreenshot captures the device's screen to a local PNG.
-//
-// This is `exec --elevate -- screenshot` with the one piece a shell pipeline
-// gets wrong: `screencap -p` writes a PNG to stdout, and stdout here is a
-// terminal. Writing to a file by default — and only writing to the terminal
-// when explicitly asked with `-o -` — is the difference between a usable
-// command and a screenful of binary.
-func cmdScreenshot(ctx context.Context, args []string) error {
-	fs := withHelp(flag.NewFlagSet("screenshot", flag.ExitOnError))
-	target := fs.String("target", "", "device ID or unique name (NS/DEV or DEV)")
-	out := fs.String("o", "", "local file to write (default screenshot-<device>-<time>.png; \"-\" writes to stdout)")
-	via := fs.String("via", "", "pin the elevation channel: su | adb")
-	fs.Parse(args)
-	rest := fs.Args()
-	// Go's flag package stops at the first non-flag argument, so
-	// `screenshot emu -o out.png` would otherwise leave -o unparsed and reject
-	// it as a stray argument. Take the device name and resume parsing.
-	if *target == "" && len(rest) > 0 {
-		*target = rest[0]
-		fs.Parse(rest[1:])
-		rest = fs.Args()
-	}
-	if len(rest) > 0 {
-		return fmt.Errorf("unexpected argument %q (usage: wanctl screenshot [DEVICE] [-o file.png])", rest[0])
-	}
-
-	c, err := client.New()
-	if err != nil {
-		return err
-	}
-
-	// Buffer rather than stream: a failed capture must not leave a truncated
-	// PNG on disk that looks like a real one. The device's stderr and any
-	// policy rejection travel on separate frames, so they still reach the user.
-	var png bytes.Buffer
-	code, err := c.ExecTo(ctx, client.ExecRequest{
-		Target: *target, Command: "screenshot", OneShot: true,
-		// Asked for elevated because Android cannot capture without it and this
-		// side cannot know what kind of device answers; a desktop gates it as
-		// an ordinary command. ElevateOptional is what lets a laptop answer
-		// without naming a channel it does not have.
-		Elevate: true, ElevateOptional: true, Via: *via,
-	}, &png, os.Stderr)
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("the capture failed on the device (exit %d)", code)
-	}
-	if png.Len() == 0 {
-		return fmt.Errorf("device returned an empty screenshot")
-	}
-	// A capture emits a PNG; anything else means the verb did not run and the
-	// bytes are some tool's error text. On a device that is not Android, an
-	// agent from before desktop capture is the usual reason.
-	if !bytes.HasPrefix(png.Bytes(), []byte("\x89PNG\r\n\x1a\n")) {
-		return fmt.Errorf("device did not return a PNG (%d bytes, starting %q); if it is not Android, run `wanctl update` on it",
-			png.Len(), firstBytes(png.Bytes(), 40))
-	}
-
-	if *out == "-" {
-		_, err := os.Stdout.Write(png.Bytes())
-		return err
-	}
-	path := *out
-	if path == "" {
-		name := *target
-		if name == "" {
-			name = "device"
-		}
-		name = strings.NewReplacer("/", "-", string(os.PathSeparator), "-").Replace(name)
-		path = fmt.Sprintf("screenshot-%s-%s.png", name, time.Now().Format("20060102-150405"))
-	}
-	if err := os.WriteFile(path, png.Bytes(), 0o644); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "%s (%d bytes)\n", path, png.Len())
 	return nil
 }
 
@@ -937,14 +890,19 @@ func cmdRead(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.WriteString(os.Stdout, res.Content); err != nil {
+	stdout, flushOut := deviceOutput(os.Stdout)
+	_, err = io.WriteString(stdout, res.Content)
+	flushOut()
+	if err != nil {
 		return err
 	}
 	truncated := "no"
 	if res.Truncated {
 		truncated = "yes"
 	}
-	fmt.Fprintf(os.Stderr, "lines %d-%d of %d, sha256 %s, truncated=%s\n",
+	stderr, flushErr := deviceOutput(os.Stderr)
+	defer flushErr()
+	fmt.Fprintf(stderr, "lines %d-%d of %d, sha256 %s, truncated=%s\n",
 		res.FirstLine, res.LastLine, res.TotalLines, res.SHA256, truncated)
 	switch {
 	case res.LongLine != 0:
@@ -997,7 +955,9 @@ func cmdEdit(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("replaced %d occurrence(s), sha256 %s\n", res.Replaced, res.SHA256)
+	out, flush := deviceOutput(os.Stdout)
+	defer flush()
+	fmt.Fprintf(out, "replaced %d occurrence(s), sha256 %s\n", res.Replaced, res.SHA256)
 	return nil
 }
 
@@ -1034,7 +994,9 @@ func cmdWrite(ctx context.Context, args []string) error {
 	if res.Created {
 		verb = "created"
 	}
-	fmt.Printf("%s %s (%d bytes, sha256 %s)\n", verb, rest[0], res.SizeBytes, res.SHA256)
+	out, flush := deviceOutput(os.Stdout)
+	defer flush()
+	fmt.Fprintf(out, "%s %s (%d bytes, sha256 %s)\n", verb, rest[0], res.SizeBytes, res.SHA256)
 	return nil
 }
 
@@ -1095,7 +1057,9 @@ func cmdPair(ctx context.Context, args []string) error {
 		fmt.Printf("✓ %s 已经信任本机, 无需操作. 直接 `wanctl exec --target %s ...` 即可.\n", *target, *target)
 		return nil
 	}
-	fmt.Printf("待审批 — 把下面这条链接交给 %s 的所有者, 他在浏览器打开并点「信任并继续」即可:\n\n  %s\n\n之后再跑 `wanctl exec/push/pull` 就能通了 (链接 5 分钟内有效).\n", *target, pairingURL)
+	out, flush := deviceOutput(os.Stdout)
+	defer flush()
+	fmt.Fprintf(out, "待审批 — 把下面这条链接交给 %s 的所有者, 他在浏览器打开并点「信任并继续」即可:\n\n  %s\n\n之后再跑 `wanctl exec/push/pull` 就能通了 (链接 5 分钟内有效).\n", *target, pairingURL)
 	return nil
 }
 
@@ -1109,21 +1073,25 @@ func cmdPeers(ctx context.Context) error {
 		return err
 	}
 	devs, aliases, shared := view.Devices, view.Aliases, view.Shared
+	// Device names and labels are chosen by whoever registered the device,
+	// which for a shared device is someone else.
+	out, flush := deviceOutput(os.Stdout)
+	defer flush()
 	if len(devs) == 0 && len(shared) == 0 {
-		fmt.Println("no devices online for this token")
+		fmt.Fprintln(out, "no devices online for this token")
 		return nil
 	}
 	if len(devs) == 0 {
-		fmt.Println("no devices of your own are online")
+		fmt.Fprintln(out, "no devices of your own are online")
 	}
 	for _, d := range devs {
 		if alias := aliases[d]; alias != "" {
-			fmt.Printf("%s  (%s)\n", d, alias)
+			fmt.Fprintf(out, "%s  (%s)\n", d, alias)
 		} else {
-			fmt.Println(d)
+			fmt.Fprintln(out, d)
 		}
 	}
-	fmt.Print(sharedPeerLines(shared))
+	fmt.Fprint(out, sharedPeerLines(shared))
 	return nil
 }
 
@@ -1240,12 +1208,16 @@ func cmdLogs(ctx context.Context, args []string) error {
 		return fmt.Errorf("--follow requires --service and is not yet supported")
 	}
 
+	// Log lines carry commands, paths and names other people chose: the
+	// controllers of this device, or the owner of the remote one.
+	out, flush := deviceOutput(os.Stdout)
+	defer flush()
 	if *target != "" {
 		c, err := client.New()
 		if err != nil {
 			return err
 		}
-		return c.Logs(ctx, *target, *logType, *grep, *since, *limit)
+		return c.LogsTo(ctx, *target, *logType, *grep, *since, *limit, out)
 	}
 	// Local read (run on the device itself).
 	lg, err := eventlog.Open("events.jsonl")
@@ -1264,7 +1236,7 @@ func cmdLogs(ctx context.Context, args []string) error {
 	}
 	for _, e := range events {
 		b, _ := json.Marshal(e)
-		fmt.Println(string(b))
+		fmt.Fprintln(out, string(b))
 	}
 	return nil
 }
@@ -1396,9 +1368,12 @@ func cmdTrust(args []string) error {
 		return err
 	}
 	peers := store.List()
-	fmt.Printf("%s: %d\n", label, len(peers))
+	// A controller names itself when it pairs.
+	out, flush := deviceOutput(os.Stdout)
+	defer flush()
+	fmt.Fprintf(out, "%s: %d\n", label, len(peers))
 	for _, p := range peers {
-		fmt.Printf("  %-20s %s  (added %s)\n", p.Name, transport.ShortFingerprint(p.Fingerprint), p.Added.Format("2006-01-02"))
+		fmt.Fprintf(out, "  %-20s %s  (added %s)\n", p.Name, transport.ShortFingerprint(p.Fingerprint), p.Added.Format("2006-01-02"))
 	}
 	return nil
 }
